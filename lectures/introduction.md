@@ -1,0 +1,267 @@
+6.1810 2024 Lecture 1: O/S overview
+
+Overview
+
+* What's an operating system?
+  [user/kernel diagram]
+  - h/w: CPU, RAM, disk, net, &c
+  - user applications: sh, cc, DB, &c
+  - kernel services: FS, processes, memory, network, &c
+  - system calls
+
+* What is the purpose of an O/S?
+  - Multiplex the hardware among many applications
+  - Isolate applications for security and to contain bugs
+  - Share data among cooperating applications
+  - Abstract the hardware for portability, convenience
+
+* Design tensions make O/S design interesting
+  - efficient vs abstract/portable/general-purpose
+  - powerful vs simple interfaces
+  - flexible vs secure
+  - portable vs exploit new hardware and interfaces
+
+* You'll be glad you took this course if you...
+  * are curious about how computer systems work
+  * need to track down bugs or security problems
+  * care about high performance
+
+Class structure
+
+* Online course information:
+  web site -- schedule, assignments, labs
+    https://pdos.csail.mit.edu/6.1810/
+    or search with Google -- all material is public
+  Piazza -- announcements, discussion, lab help
+
+* Lectures
+  * O/S ideas
+  * case study of xv6, a small O/S, via code and xv6 book
+  * lab background
+  * O/S papers
+  * submit a question about each reading, before lecture.
+
+* Labs: 
+  The point: hands-on experience
+  Mostly one week each.
+  Three kinds:
+    Systems programming (due next week...)
+    O/S primitives, e.g. thread switching.
+    O/S kernel extensions to xv6, e.g. network.
+  For help:
+    Ask+answer questions on Piazza
+    Attend TA office hours
+  Discussion is great, but please do not look at others' solutions!
+
+* Grading:
+  50% labs, based on tests (the same tests you run).
+  30% exams -- midterm, final.
+  15% lab check-off meetings: we'll ask you about randomly-selected labs.
+  5% home-work questions
+  Much of the course grade is from labs. Start them early!
+
+Introduction to UNIX system calls
+
+* Applications interact with the O/S via "system calls."
+  you'll use system calls in the first lab.
+  and extend and improve them in subsequent labs.
+
+* I'll show some application examples, and run them on xv6.
+  xv6 is an O/S we created specifically for this class.
+  xv6 is patterned after UNIX, but far simpler.
+  why UNIX?
+    an ancestor of many of today's O/Ss.
+    e.g. Linux and MacOS.
+    learning about xv6 will help you understand many other O/Ss.
+  you'll be able to digest all of xv6 -- no mysteries.
+    accompanying book explains how xv6 works, and why
+  xv6 has two roles in 6.1810:
+    example of core mechanisms
+    starting point for most of the labs
+  xv6 runs on a RISC-V CPU, as in 6.1910 (6.004)
+  you'll run xv6 inside the qemu machine emulator
+
+* example: ex1.c, copy input to output
+  read bytes from input, write them to the output
+  % make qemu
+  $ ex1
+  you can find these example programs via the schedule on the web site
+  ex1.c is written in C
+    C is probably the most common language for O/S kernels
+  read() and write() are system calls
+    they look like function calls, but actually jump into the kernel.
+    in a way that preserves user/kernel isolation.
+  first read()/write() argument is a "file descriptor" (FD)
+    passed to kernel to tell it which "open file" to read/write
+    an FD connects to a file/pipe/socket/&c
+    the FD must previously have been opened
+    a process can open many files, have many FDs
+  UNIX convention: fd 0 is "standard input", 1 is "standard output"
+    programs don't have to know where input comes from, or output goes
+    they can just read/write FDs 0 and 1
+  second read() argument is the address of some memory into which to read
+  third argument is the number of bytes to read
+    read() may read less, but not more
+  return value: number of bytes actually read, or -1 for error
+  read()/write() do not care about the format of the data
+    UNIX I/O is 8-bit bytes
+    interpretation is application-specific, e.g. database records, C source, &c
+  where do file descriptors come from?
+
+* example: ex2.c, create a file
+  open() creates (or opens) a file, returns a file descriptor (or -1 for error)
+  FD is a small integer
+  FD indexes into a per-process table maintained by kernel
+  [user/kernel diagram]
+  $ ex2
+  $ cat out
+  different processes have different FD name-spaces
+    so FD 3 usually means different things to different processes
+  these examples ignore errors -- don't be this sloppy!
+  Figure 1.2 in the xv6 book lists system calls
+    or look at UNIX man pages, e.g. "man 2 open"
+
+* what happens when a program calls a system call like open() or write()?
+  looks like a function call, but it's actually a special instruction
+    CPU saves some user registers
+    CPU increases privilege level
+    CPU jumps to a known "entry point" in the kernel
+  now running C code in the kernel
+  kernel calls system call implementation
+    sys_open() looks up name in file system
+    it might wait for the disk
+    it updates kernel data structures (file block cache, FD table)
+  restore user registers
+  reduce privilege level
+  jump back to calling point in the program, which resumes
+  we'll see more detail later in the course
+
+* I've been typing to UNIX's command-line interface, the shell.
+  the shell prints the "$" prompts.
+  the shell is an ordinary user program, not part of the kernel.
+  the shell lets you run UNIX command-line utilities
+    useful for system management, messing with files, development, scripting
+    $ ls
+    $ ls > out
+    $ grep x < out
+  UNIX supports other styles of interaction too
+    GUIs, servers, routers, &c.
+  but time-sharing via the shell was the original focus of UNIX.
+
+* example: ex3.c, create a new process
+  the shell creates a new process for each command you type
+    a process is a running program, with memory, stack, kernel state
+    isolated from other processes to contain bugs
+  ex3.c
+  the fork() system call creates a new process
+  the kernel makes a copy of the calling process
+    instructions, data, registers, file descriptors, current directory
+    "parent" and "child" processes
+  [diagram: ex3 and child]
+  so child and parent are initially identical!
+    except: fork() returns a pid in parent, 0 in child
+  a pid (process ID) is an integer; kernel gives each process a different pid
+  $ ex3
+  thus:
+    ex3.c's "fork() returned" executes in *both* processes
+    the "if(pid == 0)" allows code to know if it's parent or child
+    both processes run after the fork
+  ok, fork() lets us create a new process
+    how can we run a program in that process?
+
+* example: ex4.c, replace calling process with an executable file
+  how does the shell run a program, e.g.
+    $ echo a b c
+  a program is stored in a file: instructions and initial memory
+    created by the compiler and linker
+  so there's a file called echo, containing instructions
+    on your own computer: ls -l /bin/echo
+  ex4.c
+  exec() replaces current process with an executable file
+    discards old instruction and data memory
+    loads instructions and initial memory from the file
+    preserves file descriptors
+  $ ex4
+  exec(filename, argument-array)
+    argument-array holds command-line arguments; exec passes to main()
+    cat user/echo.c
+    echo.c shows how a program looks at its command-line arguments
+  exec() does not return if successful!
+
+* example: ex5.c, fork() a new process, exec() a program
+  the shell can't simply call exec()!
+    since it wouldn't be running any more
+    wouldn't be able to accept more than one command
+  ex5.c shows how the shell deals with this:
+    fork() a child process
+    child calls exec()
+    parent wait()s for child to finish
+  $ ex5
+  the shell does this fork/exec/wait for every command you type
+    after wait(), the shell prints the next prompt
+  exit(status) -> wait(&status)
+    status allows children to send back 32 bits of info to parent
+    status convention: 0 = success, 1 = command encountered an error
+  note: the fork() copies, but exec() discards the copied memory
+    this may seem wasteful
+    you'll eliminate the waste in the "copy-on-write" lab
+
+* example: ex6.c, redirect the output of a command
+  what does the shell do for this?
+    $ echo hello > out
+  answer: fork, child changes FD 1, child exec's echo
+  $ ex6
+  $ cat out
+  note: open() always chooses lowest unused FD; 1 due to close(1).
+  note: exec preserves FDs
+  fork, FDs, and exec interact nicely to implement I/O redirection
+    separate fork-then-exec gives child a chance to change FDs
+      before exec() gives up control
+      and without disturbing parent's FDs
+  FDs provide indirection
+    commands just use FDs 0 and 1, don't have to know where they go
+  thus: only sh knows about I/O redirection, not each program
+
+* It's worth asking "why" about design decisions:
+  Why these I/O and process abstractions? Why not something else?
+  Why provide a file system? Why not let programs use the disk their own way?
+  Why FDs? Why not pass a filename to write()?
+  Why not combine fork() and exec()?
+  UNIX works well, but there are other good designs!
+
+* example: ex7.c, communicate through a pipe
+  how does the shell implement
+    $ ls | grep x
+  an FD can refer to a "pipe", rather than a file
+  the pipe() system call creates two FDs
+    read from the first FD
+    write to the second FD
+  the kernel maintains a buffer for each pipe
+    [u/k diagram]
+    write() appends to the buffer
+    read() waits until there is data
+  $ ex7
+
+* example: ex8.c, communicate between processes
+  pipes combine with fork() to allow parent/child to communicate
+    create a pipe,
+    fork,
+    parent writes to one pipe fd,
+    child reads from the other.
+    [diagram]
+  $ ex8
+  the shell builds pipelines by forking twice and calling exec()
+  pipes are a separate abstraction, but combine well w/ fork()
+
+* example: ex9.c, list files in a directory
+  how does ls get a list of the files in a directory?
+  you can open a directory and read it -> file names
+  "." is a pseudo-name for a process's current directory
+  $ ex9
+  see ls.c for more details
+
+* Next week
+  - more about what happens when programs like this execute
+  - more about C programming
+  - first lab due next thursday, you'll use these system calls
+解释
