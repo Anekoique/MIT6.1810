@@ -1,0 +1,199 @@
+6.1810 2022 Lecture 8: Q&A
+
+Plan: answering your questions
+  Approach:
+    walk through staff solutions
+    start with pgtbl lab because it was the hardest
+    your questions are at bottom of this file
+
+time.txt:
+  Lab util
+    Total subs: 129, Valid subs: 125
+    Mean: 8.8, Median: 8.0, Stddev: 3.79
+  Lab syscall
+    Total subs: 123, Valid subs: 121
+    Mean: 7.1, Median: 6.0, Stddev: 3.02
+  Lab pgtbl
+    Total subs: 94, Valid subs: 90
+    Mean: 12.5, Median: 12.0, Stddev: 5.11
+ 
+Pgtbl lab comments
+  traditionally a difficult lab
+  few lines of code, but difficult-to-debug bugs
+  - worst case: qemu/xv6 stops running
+  - "best" case: kernel panic
+  hard to debug:
+    one small error in setup may not expose itself until the relevant page is used
+    errors in this lab mostly panics
+    errors may be more suble in later labs when page faults change page tables
+  hard to debug for staff too
+  - there are so many possible reasons why
+
+=== ugetpid() ===
+
+Goal:  Avoid kernel transitions
+
+Idea:
+  Expose kernel state to user space
+    augment user space diagram with USYSCALL
+  Which system calls can be sped up?  (see kernel/syscall.h)
+    can we move system call to user space that write kernel state?
+    can we move system call to user space that read kernel state related to other processes?
+
+Candidate are:
+  getpid()
+  uptime()
+  fstate()?
+     maybe possible, but too much state?
+
+Demo
+  pgtbltest.c
+  ulib.c
+  kernel/memlayout.h
+  kernel/proc.c:
+    proc_pagetable()
+    freeproc()
+
+Linux has vDSO (https://lwn.net/Articles/615809/)
+  vDSO: virtual dynamic shared object
+    cat /proc/<pid>/maps
+  read-only, shared memory region
+  vdso library mapped into each user program
+    library interprets data in the shared region
+  example timer measurements
+    kernel posts time to shared region
+    vDSO code adds TSC to latest time
+  calls implemented using vDSO (virtual system calls)
+    clock_gettime(), getcpu(), getpid(), getppid(), gettimeofday(), set_tid_address()
+      
+=== Superpages ===
+
+goal: use TLB more efficient
+  memory size is increasing but capacity of TLB not
+  increase regular page size from 4KB to 64KB?
+    leads to many partially-used regular pages
+    often called "internal fragmentation"
+
+idea: have different page sizes (e.g., 4KB, 2MB, 1G)
+  correspond levels in the page table
+  when is a level PTE a leaf instead of pointer to next level?
+    risc-v: when PTE permssions are set (see kernel/riscv.h)
+  is it worth it?
+    https://www.usenix.org/conference/osdi-02/practical-transparent-operating-system-support-superpages
+    https://www.usenix.org/system/files/login/articles/login_fall20_05_zhu.pdf
+    https://www.usenix.org/system/files/atc20-zhu-weixi_0.pdf
+   
+Lab exercise
+  explore programming the page-table hardware for super pages
+    for one test case
+    ignores real-world issues (see below)
+
+How to get started?
+  Read the test cases
+  Read the relevant files (vm.c and kalloc.c)
+  Think about overall design but implement in minimal steps ("be lazy")
+    If you run into a bug, you can undo the last small step
+  [git checkout student repo and modified it ]
+  
+Test case
+  grade-lab-pgtbl
+    test_superpg_
+    test_usertests 
+  1 sbrk of 8MB
+  1 fork
+  Start simple: pass first supercheck
+  what does supercheck check for?
+  
+sbrk
+  need at most 4 super pages
+    add kptbl() right after sbrk(N)
+      what entries do we want to turn into super pages?
+    kalloc.c
+      set aside a few regions in freerange()
+      can we integrate kallocn and kalloc?
+    uvmalloc()
+      uvmallocn
+        why is mset important?
+      walkallocn
+        can we integrate walkallocn and walk()
+      why set the permission bits?
+    run test; look at pgtbl printout
+      we got 3 super pages!
+      but failed second supercheck
+         and kernel paniced at uvmunmap
+    let fix panic first
+      what is the panic telling us?
+    fork
+      uvmcopy()
+      uvmcopyn()
+
+Real-world:
+  Goal: OS uses super pages transparently
+  Challenge: dynamic switching between superpages and regular pages
+    allocation: on page fault allocate super page or regular page?
+      reservation vs copy?
+    fragmentation: proactively page out physical memory to avoid fragmentation
+      but cost extra disk reads
+    promotion: incrementally collect several regular page into a superpage
+      update page table but maybe only parts of the superpage will be used
+
+=== Questions ===
+
+Could you explain why our lab's implementation of super pages could "be
+more real"? Thanks.
+
+Why didn't we need to modify uvmdealloc to handle superpages for the
+lab?
+
+What would be the alternative to representing free memory as a linked
+list? Would advantages would these alternative methods have compared
+to storing as a linked list?
+
+Also, how exactly does paging hardware track dirty pages?
+
+Why wwere the design choices made for the page table lab? Why is the
+pagetable specifically 3 levels, and how would it be possible to
+integrate a TLB into our implementation?
+
+How is the balance between superpages and normal pages decided in
+practice? For this lab just a few superpages was enough, but would you
+need to switch them back and forth in practice?
+
+Can you explain the role of the different pte bits in the context of the
+superpages and vmprint assignments? I understand the general idea of page
+tables but the bits and PA VA conversions tripped me up.
+
+Similarly, I'd also like some hints about how to approach labs in the
+future. I find that a lot of files in the OS haven't had much
+introduction and sometimes find myself resorting to guess and check
+then completing the assignments. It would be good to have a primer about
+the general structure of the OS to help me navigate it better.
+
+Why are some files in xv6 written in assembly and some written in C? What
+are the constraints that would require us to write a file in one of the
+languages versus another?
+
+can you explain more about superwalk() and how it relates to level two and
+level one of the page table, and similarly how supermappage() also
+utilizes the levels of the page table?
+
+I have a question regarding speed up syscall for pgtbl. What are some
+insights to consider when asnwering the question "Which other xv6 system
+call(s) could be made faster using this shared page?"
+
+What is the correct way to handle the case where a process wants to
+deallocate a page of memory but it currently has a superpage of memory?
+Should the superpage be split and copied into many normal pages?
+
+In pgtbl lab, I noticed that uvmunmap has the for loop [for(a = va; a < va
+++ npages*PGSIZE; a += sz)], which I didn't need to change even after
+including a case for superpages. I'm confused on why I didn't need to
+modify the upper bound of this loop when superpages are much larger than
+regular pages. Was this just because the test cases didn't reach the end
+of the loop?
+
+Why is it not necessary to call uvmdealloc for superpages?
+
+For pgtbl 1st question, other than understanding the permissions (valid,
+readable, executable, user), is there other things we can infer? How do
+we know what it would logically contain?

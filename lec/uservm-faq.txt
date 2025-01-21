@@ -1,0 +1,134 @@
+Frequently Asked Questions for Appel & Li's paper "Virtual memory
+primitives for user programs"
+
+Q: What is the relationship of the garbage collector to the OS?
+
+A: No direct relation. The garbage collector is part of a language
+runtime (e.g., Python or Go runtime). The python interpreter, for
+example, runs as a user program, on top of the kernel, and one
+component of the interpreter is the garbage collector.  Unlike in C,
+in these languages the developer doesn't have to call malloc/free to
+manage memory but the language garbage collector manages memory for
+the developer.  This avoids many common programming mistakes such as
+double free, use after free, etc.
+
+Q: What GC algorithm does Python use?
+
+A: Cpython, a common python interpreter uses several different garbage
+collector implementations (see
+https://github.com/python/cpython/blob/main/InternalDocs/garbage_collector.md).
+One of them is a generational one.
+
+Q: Do page faults work correctly on pipelined processors?
+
+A: Today's CPUs provide what is called "precise" interrupts, which
+guarantee that the save process state corresponds to a sequential CPU
+that completes one instruction before starting on the next one.
+Implementing precise interrupts in a pipelined processor is
+nontrivial.
+
+Q: Who keeps track if a page is dirty?
+
+A: The hardware typically keeps track of whether a page has been
+written too (dirtied).  For example, the RISC-V maitains a Dirty bit
+in the PTE (see figure 3-2 in the xv6 text). Many operating systems
+don't make that bit visible to user applications, however; the paper
+argues that is a shame because user applications could benefit from
+it.
+
+Q: Are data page compression algorithms for VM used in practice?
+
+A: Check out https://en.wikipedia.org/wiki/Virtual_memory_compression
+for a history of developments, and recent usages, including Android
+(https://developer.android.com/topic/performance/memory-management),
+which uses Linux's zram.
+
+Q: Is it possible to combine concurrent and generational garbage collection?
+
+A: Yes,  see, for example: https://dl.acm.org/doi/pdf/10.1145/96709.96735
+
+Q: Why doesn't xv6 support user VM primitives? How would we go about
+adding this feature??
+
+A: Because xv6 goal is to be a minimal educational OS. You will
+implement, however, some user-level VM primitives in the mmap lab.
+
+Q: How relevant is the information about disk locality (and some of
+the other assumptions made in the paper) with the developments of
+flash memory?
+
+A: Less so. Access times to flash memory are much lower than to
+magnetic disks. Yet, flash memory is still orders of magnitude slower
+than RAM, so it still matters.
+
+Q: Would there be a tradeoff between cross-platform compatibility and
+user-level algorithms aimed specifically at things like Prot1 vs ProtN?
+Or do modern programs write separate low-level code for each, or do
+modern OSes all implement a similar set of primitives?
+
+A: Modern OSes implement a similar set of primitives; check out mmap,
+munmap, sigaction, and related systems calls (e.g., run ``man mmap''
+on the command line).
+
+Q: How often does checkpointing happen? Every time a thread needs
+writes to memory, does the OS have to checkpoint by saving the
+writable main memory space for the program and restart all threads?:
+
+A: It is up to the application to chose how often to
+checkpoint---checkpointing every write doesn't make sense because it
+is too costly; you should think more in terms of many minutes time
+frame. For example, you may want to checkpoint a long-running compute
+application periodically so that you don't have to start from scratch
+in case the computer crashes.
+
+Q: How exactly is data compressed and uncompressed in the
+ data-compression paging scheme?
+
+A: Using a compression algorithm. zram (see above) uses zstd
+(https://en.wikipedia.org/wiki/Zstd).
+
+Q: I'm also not clear about intuition behind why we translate between
+32-bit and 64-bit addresses for pointers to extend addressability.
+
+A: This example is a bit arcane given that today pointers on most CPU
+are 64 bits.
+
+Q: What exactly is a mutator and a collector?
+
+A: This is garbage-collector jargon: the mutator is an application
+program (say a python program) that has objects and read/writes them,
+and the collector is a component of the runtime doing the garbage
+collection.
+
+Q: How does the OS guarantee security when the user mode can specify a
+fault handler?
+
+A: The kernel forwards the page faults to the process who experienced
+the fault.  Thus, a process sees only its own page faults and can
+modify only its own address space.  If the handler has a bug, then the
+process may crash, but only that processes crashes.
+
+Q: When are persistent stores used?
+
+A: A file system is an example of a persistent store.  The persistent
+store in the paper extends persistence to objects of a running
+program, so that the developer doesn't explicitly have to persist
+objects (i.e., invoke file system calls).  It is not a super popular
+idea currently but some systems provide it.
+
+Q: How much do vm techniques affect database implementations
+currently?
+
+A: Databases commonly use mmap to map databases files into the address
+space of the database server so that the database can rely on the OS
+page cache for caching blocks of the file (instead of having to
+implement its own buffer cache and potentially suffer double
+buffering). There are some interesting critiques of using mmap for
+databases; for example, see https://db.cs.cmu.edu/mmap-cidr2022/.
+
+Q: How are persistent stores that haven't been saved to the disk recovered in
+the instance of a crash?
+
+A: Often they support transactions to update a group of objects
+atomically.  The transaction system typically uses logging.  From
+today's paper perspective crash-safety is an orthogonal issue.

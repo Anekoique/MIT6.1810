@@ -1,0 +1,328 @@
+Title: Kernel extensibility
+Author: Sanjit Bhat (sanjit.bhat@gmail.com)
+
+Broadly: being able to dynamically update the kernel.
+Fig:
+    [user]
+    ---
+    [kernel]
+    [[ instead of strict separation ]]
+    [user + mod]
+    --- [send mod]
+    [kernel + mod]
+
+Why is this useful:
+1. Observability: seeing what's going on in the kernel.
+1. Performance: making the kernel do more/better things for us.
+1. Security: specifying more complex allow/deny filters for things.
+
+Demo examples (from https://github.com/iovisor/bcc):
+1. Printing 'hello world' on process startup.
+    - Hooks onto proc clones.
+```
+$ sudo python3 ~/bcc/examples/hello_word.py
+```
+1. Latency distributions on disk ops.
+    - Measures latency between I/O reqs and device completion.
+    - Periodically calculates percentiles.
+```
+$ sudo python3 ~/bcc/examples/tracing/biolatpcts.py
+$ python3 file-gen.py
+```
+1. DDOS attack detection.
+    - Intercept packets early on, so they don't overwhelm our system.
+    - Configure the kernel to measure time diffs between packets.
+    - Alert when there's a big enough diff.
+```
+$ sudo python3 ~/bcc/examples/tracing/dddos.py
+$ sudo hping3 localhost -S -A -V -p 443 -i u100
+```
+
+How could this work?
+1. Run arbitrary binaries in the kernel?
+1. Run binaries from only "trusted" parties?
+1. Constrain the binaries somehow?
+1. Skip the kernel altogether?
+
+Those all have their tradeoffs, and we'll revisit alternate approaches later.
+eBPF uses the binary constraint approach.
+Let's dive into that with a canonical cBPF (eBPF predecessor) example.
+
+tcpdump - utility to do network monitoring.
+Let's ask it to get all TCP connections, including my SSH conn.
+```
+$ sudo tcpdump -p -ni enp0s1 -d "ip and tcp"
+(000) ldh      [12]
+(001) jeq      #0x800           jt 2    jf 5
+(002) ldb      [23]
+(003) jeq      #0x6             jt 4    jf 5
+(004) ret      #262144
+(005) ret      #0
+```
+
+Observation: wow, there's assembly-like insns here!
+How does it work?
+Fig:
+    [user: tcpdump -> bpf prog]
+    --- [send prog]
+    [kernel + bpf prog]
+
+But wait, are these even insns in the native OS arch?
+cBPF abstract machine:
+Regs: acc, idx.
+Mem: packet, scratch.
+Ops: ld, st, jmp, (arith), ret, tax.
+
+Ethernet frame:
+[dst MAC | src MAC | ethertype | data]
+   6B        6B         2B
+IP frame:
+[header1 | len | header2 | prot | checksum | src | dst | data]
+   2B       2B     5B       1B      2B        4B    4B
+
+cBPF code annotation:
+0: acc <- P[12] (ethertype)
+1: j (acc == IP)
+2: acc <- P[23] (IP prot)
+3: j (acc == TCP)
+4: ret packet len
+5: ret false
+
+How does this diff arch get executed?
+Interpreter:
+    - C program that reads cBPF prog.
+    - "Emulates" the language.
+    - Runs in same addr space as kernel, for efficiency.
+
+Refine fig:
+    [user: tcpdump -> bpf prog]
+    --- [send prog]
+    [kernel + interpreter(bpf prog)] <-- both in same addr space
+
+The elephant in the room:
+Q: since this is an assembly-like language reading/writing packet data, does this break isolation?
+A: Remember, eBPF's plan constrains binaries, but how?
+
+Security threat model for pkt filtering:
+    - Allow non-root (malicious) procs to run progs.
+    - Allow reading regs, packet mem, scratch mem.
+    - Allow writing regs and scratch mem.
+    - Disallow reading/writing outside that.
+
+What's an example malicious program?
+```
+(000) ldh [huge num]
+```
+    - Reads past end of packet mem into other kernel mem.
+Q: How to disallow?
+A: Look thru prog ahead of time and disallow big offsets.
+
+What do we do with non-const offsets?
+```
+(000) ldx 4*([14]&0xf) // Load TCP offset into idx reg, based on IP len.
+(001) ldh [x+16] // Load TCP dst port.
+```
+    - The overall offset includes the TCP len.
+    - We could put a max bound on that, but then over-approx offset.
+    - Instead, have to check actual offset at interpreter runtime.
+
+Until now, been describing cBPF (v2.5, 2001).
+Just packet filtering on net hooks.
+Over time, people wanted more speed and generality (i.e., using eBPF in more sub-systems than just net).
+
+Speed:
+Interpreter slow (why do people always complain about Python slowness?).
+Emulating a prog vs. directly running it.
+BPF looks so similar to an actual arch, so let's directly compile to one.
+JIT compiler (v3.0, 2011).
+
+Generality:
+Hook into system calls, function entry/exit, storage stack, etc.
+New eBPF lang (v3.18, 2014) that looks more like native arch.
+Regs: 11 (R0 - R10). Width 32 -> 64 bits.
+Mem: stack (cBPF scratch), context (cBPF packet), map (allow uspace comm and persis).
+Func: call bpf helpers.
+Isolation:
+    - Depends on use case.
+    - Still fairly restricted, modulo bpf calls.
+    - I.e., can't natively get arb kptr and deref.
+    - Need to use bpf calls to do that.
+
+New ecosystem (see https://ebpf.io/what-is-ebpf/#loader--verification-architecture):
+Fig:
+    [Dev box]
+    User: eBPF prog (in C) -> [clang] -> eBPF bytecode (prog, maps)
+    ↓ bytecode
+    [Runtime box]
+    Python bcc lib
+    ↓ syscall, ↑ maps
+    Kernel: bytecode -> [eBPF verifier] -> checks passed.
+            bytecode -> [JIT compiler] -> native insns.
+            Hook bin.
+            Create maps.
+[Go to terminal to show that in action with the demos.]
+
+Let's get back to isolation.
+Q: how do we handle non-const offset with JIT'd code?
+A: the runtime pointer value check we did previously isn't feasible.
+
+So how can we do it?
+Goal: track ptr vals, but can't do at runtime.
+Solution: full symbolic execution.
+    - Simulate all possible prog paths.
+    - Track ptr vals.
+    - Ensure they're in bounds.
+
+Verifier intro:
+1. Split vals into PTR and SCALAR.
+SCALAR can never be used as mem addr.
+1. Track vals as they go thru.
+
+Example val tracking:
+```
+R1 starts PTR, by def it's ptr to ctx
+R1=R2? Wrong bc R2 uninit.
+R2=R1+R1. What should R2 type be? SCALAR.
+ret R1? Depends on ordering and prog.
+        Not ok to ret PTR in some programs. KASLR.
+R3 = R10-8
+R4 = *R3? No, bc uninit.
+*R3 = R1
+R4 = *R3? R3 type? PTR.
+*(R3 + 10) = 5? No, bc OOB.
+R5 = map[0]
+if R5 < 8:
+    R4 = *(R3 + R5)? Fine bc of if branch.
+R4 = *(R3 + R5)? Not fine bc of other if branch.
+```
+
+These ptrs seem like a real pain. How to track them?
+1. Fixed (exactly-known) offset and variable offset.
+For variable offset:
+1. Min/max signed/unsigned, 32/64-bit.
+1. Tnum: knowledge of individual bits.
+    - mask = 1, unknown. = 0, known.
+    - if known, value is actual bit.
+
+Example:
+```
+R2 (mask=0b0011, val=0b1000)
+R3 |= 0b1 (mask=0b0010, val=0b1001)
+R3 &= 0b00 (mask=0b0000, val=0b1001)
+(mask=0b1, val=0b1)? No, that would violate some invariant of the tnum.
+```
+```
+R5 = map[0] (min=0, max=MAXVAL)
+R6 = R5 + 5 (min=5, max=MAXVAL)
+            // tnum here? Hard.
+if R5 < 8:
+    R5 (min=0, max=8)
+    tnum here? Hard.
+R5 (min=0, max=MAXVAL)
+R6 = R5 | 0b1 (mask=0b1..0, val=0b0..1)
+              // reg bounds here? Hard.
+```
+[Demo: show my low-level eBPF progs with verifier debug outputs.]
+
+[Demo: show the actual verifier code at `linux/kernel/bpf/verifier.c` to get
+a sense of the full verifier complexity.]
+The eBPF verifier does some pretty complex math.
+Let's formally verify the eBPF verifier.
+Ref: https://sanjit-bhat.github.io/assets/pdf/ebpf-verifier-range-analysis22.pdf.
+Spec for the range func that tracks adding two nums:
+```
+{{{
+    ∀ x y,
+    oldRng1.contains(x) ∧
+    oldRng1.wf() ∧
+    oldRng2.contains(y) ∧
+    oldRng2.wf()
+}}}
+addRanges(oldRng1, oldRng2)
+{{{
+    RET (newRng1);
+    ∀ z,
+    z = x + y →
+    newRng1.contains(z) ∧
+    newRng1.wf()
+}}}
+```
+    - Containment is intuitive. E.g., min <= x <= max.
+    - Wf (well-formedness) encodes invariants of the range. E.g., min <= max.
+
+Misc verifier things:
+1. Pruning. Notion of when one verifier path down CFG subsumed by another.
+   If you've already checked the other path, no need to check this one.
+1. Liveness tracking. To help pruning.
+1. The pruning needs to be:
+    - Aggressive, track precise state to reduce symbolic execution paths.
+    - Not too aggressive that it's unsafe.
+
+Next part of lec:
+
+eBPF is amazing:
+1. Observability.
+    - Performance debugging.
+    - Kubernetes cluster monitoring.
+    - See https://ebpf.io/applications/ for a bunch of these.
+1. XDP. Insert net hook directly after driver.
+    - CloudFlare DDOS prevention and load balancer. https://blog.cloudflare.com/cloudflare-architecture-and-how-bpf-eats-the-world/.
+1. LSM. Granular security policies for containing procs.
+    - https://blog.cloudflare.com/live-patch-security-vulnerabilities-with-ebpf-lsm/.
+1. Academic ones: see OSDI/SOSP from last few years.
+    - In-kernel storage with XRP. https://www.usenix.org/conference/osdi22/presentation/zhong.
+    - User-defined scheduling with Syrup. https://dl.acm.org/doi/10.1145/3477132.3483548.
+
+But...
+How general is it, really?
+Can / should we just add hooks to everything?
+Let's walk through some examples of where extending eBPF required care.
+
+eBPF calls directly into kernel funcs.
+    - Compile to call insns.
+    - Now calling across "architectures".
+    - Diff calling conventions.
+    - R6-R9 callee-saved. So get those back.
+    - R1-R5 caller-saved. Clobbered. Unusable after call. Need to track that in verifier.
+    - Also, kernel funcs were not designed to be called from "hostile caller".
+    - eBPF verifier does minimal checks to see if the call is "safe".
+    - See https://lwn.net/Articles/856005/.
+    - See https://sigops.org/s/conferences/hotos/2023/papers/jia.pdf.
+
+Unprivileged eBPF:
+    - Before, allowed for certain low-capability progs like socket filters.
+    - Now, lot of verifier bugs.
+    - So we're in some intermediate state.
+        + Only root can call eBPF progs.
+        + They can't be malicious.
+        + But we also don't want them to mess up the kernel? So need some verifier checks.
+    - Threat model more complicated.
+    - See https://lwn.net/Articles/796328/.
+
+eBPF in scheduler:
+    - Seemingly useful. Allow user to customize scheduling for their particular app.
+    - E.g., in virtualized Linux, minimize host scheduler interference with guest scheduler.
+    - However, scheduler is such an important part of kernel, that do we really want users to have their own?
+    - That could disincentivize globally patching scheduler bugs and fragment the scheduler ecosystem.
+    - See https://lwn.net/Articles/873244/.
+
+Sleepable eBPF progs:
+    - What if you want an eBPF prog that takes in a uspace ptr (e.g., some security prog).
+    - The ptr won't always be mapped, so accessing it might cause a page fault... during the prog.
+    - But eBPF progs aren't meant to be blocked.
+    - Blocking actually causes lots of issues, e.g., with map RCUs or critical path net hooks.
+    - So be very careful what progs you're allowed to make sleepable, and constrain them even more.
+    - See https://lwn.net/Articles/825415/.
+
+Big concern: is eBPF even the right approach to extensibility?
+    - eBPF: allow easier kernel modifications.
+    - Another option: bypass the kernel and send data directly to uspace.
+    - Pros: no need to design special hooks or verifiers.
+    - Cons: might need special hardware to do it.
+    - See https://irenezhang.net/papers/demikernel-sosp21.pdf.
+
+Conclusion:
+    - eBPF enables a lot of really cool stuff.
+    - Its isolation is powered by a sophisticated verifier.
+    - But it's not a silver bullet for extensibility.
+    - Careful thought needs to be put in to not break isolation.

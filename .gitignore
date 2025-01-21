@@ -1,2 +1,4 @@
 .vscode/
-/lec
+*.pdf
+*.jpg
+*.png

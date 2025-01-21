@@ -1,0 +1,336 @@
+6.1810 2023 Lecture 12: Coordination (sleep&wakeup)
+
+# plan
+  review two points about xv6 thread switching
+  sequence coordination
+    sleep & wakeup
+    lost wakeup problem
+  termination
+
+review #1: why hold p->lock across swtch()?
+   this requirement affects many situations in xv6
+   yield()                     scheduler()
+   -------                     -----------
+   acquire(&p->lock);
+   p->state = RUNNABLE;
+   swtch();
+                               swtch();
+                               release(&p->lock);
+
+two reasons to hold p->lock across swtch():
+  1. prevent another core's scheduler from seeing p->state == RUNNABLE
+     until after the original core has stopped executing the thread
+     and after the original core has stopped using the thread's stack
+  2. prevent timer interrupt from calling yield() during swtch()
+     (remember: acquire() turns off interrupts)
+     2nd swtch() would overwrite already-saved registers in context
+
+review #2: why does xv6 never hold a spinlock when yielding the CPU?
+   (other than p->lock)
+   on a single-core machine, imagine this:
+     P1           P2
+     acq(x)
+     sched()
+                  acq(y)
+                  acq(x)
+   P2 will wait forever:
+     P2 will spin waiting for P1 to release x
+     P2 holds y, so it must keep interrupts off
+     No clock interrupts, so P2 won't yield() and P1 won't run
+     So P1 won't ever release x
+   possible even on multi-core, with more locks/threads
+   solution: forbid holding lock when yielding the CPU!
+     (other than p->lock)
+
+# topic: sequence coordination
+  threads often wait for specific conditions:
+    a disk read is complete (signaled by an interrupt)
+    a pipe has data to read (written by another process)
+    a child has exited
+
+# coordination is a fundamental building-block for thread programming.
+  but subject to rules that can present puzzles.
+
+# why not just have a while-loop that spins until condition is true?
+  pipe read:
+    while buffer is empty {
+    }
+  pipe write:
+    put data in buffer
+
+# better solution: coordination primitives that yield the CPU
+  there are a bunch e.g. barriers, semaphores, event queues.
+  xv6 uses sleep & wakeup
+    used by many systems
+    similar to "condition variables"
+
+# example: uartwrite() and uartintr() in kernel/uart.c
+  recall: the UART is the device hardware that connects to the console
+  I've simplified my copy of uart.c to focus on sleep/wakeup story 
+    see "code" link on schedule page
+  the basic idea:
+    the UART h/w accepts one byte of output at a time
+      h/w takes a long time to send each byte, perhaps a millisecond
+    processes writing the console must wait until UART sends prev char
+    the UART h/w interrupts after it has sent each character
+      writing thread should give up the CPU while waiting for interrupt
+  write() calls uartwrite() with a buffer of output
+    uartwrite() writes first byte (if it can)
+    uartwrite() calls sleep() to wait for the UART's interrupt
+    uartintr() calls wakeup()
+  tx_busy == 0 is the "condition" uartwrite() is waiting for
+    set by uartwrite(); cleared by uartintr()
+  the "&tx_chan" argument serves to link the sleep and wakeup
+    "wait channel"
+    just a number, tells wakeup which sleeping threads to wake
+  simple and flexible:
+    sleep/wakeup don't need to understand what you're waiting for
+
+# why the lock argument to sleep()?
+  sadly you cannot design sleep() as cleanly as you might hope
+  sleep() cannot simply be "wait for wakeup() to be called"
+  the problem is called "lost wakeups"
+  here's the story
+
+# suppose just sleep(chan); how would we implement?
+  here's a BROKEN sleep/wakeup
+  [on board, not in vi]
+  broken_sleep(chan)
+    p->state = SLEEPING;
+    p->chan = chan;
+    sched();
+    (now scheduler() won't run it -- not RUNNABLE)
+  wakeup(chan)
+    for each p:
+      if p->state == SLEEPING && p->chan == chan:
+        p->state = RUNNABLE
+  wakeup wakes up all threads sleeping on chan
+    may wake up more than one thread
+  sleep and wakeup treat wait channel as just a 64-bit number
+    they know nothing of the actual condition the thread is waiting for
+    chan usually the address of a convenient shared object
+  (I've omitted p->lock, which both need)
+
+# how would uart code use this (broken) sleep/wakeup?
+  int busy
+  int chan
+  uartwrite(buf):
+    for each char c:
+      while busy:
+        broken_sleep(&chan)
+      send c
+      busy = 1
+  uartintr():
+    busy = 0
+    wakeup(&chan)
+  busy==0 is the condition we're waiting for
+  &chan is the wait channel (a dummy variable)
+
+# but what about locking?
+  - driver's data structures e.g. busy
+  - UART hardware 
+  both uartwrite() and uartintr() need to lock
+  should uartwrite() hold a lock for its whole lifetime?
+    no: then uartintr() can't get lock and clear busy
+  maybe uartwrite() could release the lock before sleep()?
+  let's try it -- modify uart.c to call broken_sleep()
+    release(&uart_tx_lock);
+    broken_sleep(&tx_chan);
+    acquire(&uart_tx_lock);
+  make qemu ; cat README
+
+what goes wrong when uartwrite() releases the lock before broken_sleep()?
+  uartwrite() saw tx_busy = 1 (UART not done with previous byte)
+  interrupt occurred after release(), before broken_sleep()
+    tx_busy = 0
+  then uartwrite() calls sleep()
+  uartwrite() went to sleep EVEN THOUGH UART TX INTERRUPT WAS DONE
+    and tx_busy is zero...
+  now there is nothing to wake up uartwrite(), it will sleep forever
+    really, until next UART interrupt, due to input
+
+this is the "lost wakeup" problem.
+
+we need to eliminate the window between uartwrite()'s check of
+  the condition, and sleep() marking the process as asleep.
+  we'll use locks to prevent wakeup() from running during the entire window.
+
+we'll change the sleep() interface and the way it's used.
+  sleep() will require that there be a "condition lock" that prevents
+    the condition from changing, and require that the callers of
+    both sleep() and wakeup() hold this lock
+  sleep(chan, lock)
+    caller must hold lock
+    sleep releases lock, re-acquires before returning
+  wakeup(chan)
+    caller must hold lock
+
+sleep does not know what the condition is, or how the lock relates to it
+  BUT the lock must prevent changes to the condition being waited for!
+  AND the lock must be passed to sleep()
+
+(repair uart.c)
+
+let's look at wakeup(chan) in proc.c
+  it scans the process table, looking for SLEEPING and chan
+  it grabs each p->lock
+  remember also that caller acquired condition lock before calling wakeup()
+  so wakeup() holds BOTH the condition lock and each p->lock
+
+Q: why is it enough to just set p->state = RUNNABLE?
+   why does that cause the thread to (eventually) run?
+
+let's look at sleep() in proc.c
+  hmm: sleep *must* release the condition lock
+    since we can't hold locks when calling swtch(), other than p->lock
+    and waker will need it to modify the condition
+  Q: how to prevent wakeup() from running after sleep() releases
+     the condition lock?
+  A: acquire p->lock *before* releasing condition lock
+     so, throughout, sleep() holds either lk, p->lock, or both
+  since wakeup() holds *both* locks, it's enough for sleep() to hold *either*
+    to force wakeup() to spin rather than look at process calling sleep()
+  now wakeup() can't proceed until after sleep()'s swtch() completes
+    so wakeup() is guaranteed to see p->state==SLEEPING and p->chan==chan
+  thus: no lost wakeups!
+    wakeup() cannot sneak in between check of condition and sleep()
+
+[time diagram, or narrate, lines for locks]
+  uartwrite()         uartintr()
+  -----------         ----------
+  acq tx_lock         acq tx_lock
+  check tx_busy       tx_busy = 0
+  sleep()             wakeup
+  acq p->lock         acq p->lock
+  rel tx_lock         check SLEEPING / chan
+  SLEEPING            rel p->lock
+  swtch               rel tx_lock
+  rel p->lock
+
+note that uartwrite() wraps the sleep() in a loop
+  i.e. re-checks the condition after sleep() returns, may sleep again
+  two reasons:
+    1. maybe multiple waiters, another thread might have set tx_busy
+    2. kill() wakes up processes even when condition isn't true
+  all uses of sleep are wrapped in a loop, so they re-check
+
+# Another example: piperead() in pipe.c
+  the condition is data waiting to be read (nread != nwrite)
+  the condition lock is the pipe's pi->lock
+  pipewrite() calls wakeup() at the end
+  what is the race if piperead() used broken_sleep()?
+    lost wakeups are not just about interrupts!
+  note the the loop around sleep()
+    multiple processes may be reading the same pipe
+  why the wakeup() at the end of piperead()?
+
+# the sleep/wakeup interface/rules are a little complex
+  in particular, sleep() needs the condition lock
+  but, sleep() doesn't need to understand the condition
+  sleep/wakeup is pretty flexible, though low-level
+  there are other schemes that are cleaner but perhaps less general-purpose
+    e.g. the counting semaphore in today's reading
+  all have to cope with lost wakeups, one way or another
+
+*************
+
+# another coordination challenge -- how to shut down a thread?
+
+# xv6 has two ways to get rid of processes: exit() and kill()
+
+# exit() puzzle: a thread cannot free all of its own resources
+  e.g. its own stack, which it is still using
+  e.g. its struct context, which it may need to call swtch()
+
+# exit():
+  where we want to end up:
+    p->state = UNUSED, so a future fork() can use this proc[] slot
+    and all resources free
+  the strategy:
+    exit() frees some things, but not struct proc or kernel stack
+    parent's wait() does the final frees
+
+# exit() in proc.c:
+    some cleanup
+    wake up wait()ing parent
+    p->state = ZOMBIE
+      can't be UNUSED yet!
+        still using kernel stack and proc[] entry
+      ZOMBIE means ready for parent's wait()
+        but fork() won't allocate it (not UNUSED)
+        and scheduler won't run it (not RUNNABLE)
+    swtch() to scheduler
+
+# wait() in proc.c (parent will eventually call):
+  scans proc[] table for any child with p->state==ZOMBIE
+  calls freeproc()
+    (p->lock held...)
+    trapframe, pagetable, ..., p->state=UNUSED
+  could child still be executing, just after exit() set p->state to ZOMBIE?
+    no: exit() held p->lock during that time
+    so it's safe to free child's stack and struct proc
+  thus: wait() is not just for app convenience, but for O/S as well
+
+#  what avoids a lost exit()->wait() wakeup?
+   if child exit()s between parents check for ZOMBIEs, and parent sleep()
+   what's the condition?
+     some child is a ZOMBIE
+   what's the condition lock?
+   can't be child's p->lock, since parent wait() doesn't know
+     which child it is waiting for!
+   so: wait_lock is the condition lock
+     it's a global variable, not per-process
+   wait():
+     holds wait_lock while scanning proc[] for a ZOMBIE child
+     wait_lock is the condition lock wait() passes to sleep()
+   exit():
+     holds wait_lock around p->state=ZOMBIE and wakeup(p->parent)
+   so: child exit() must wait for parent to finish ZOMBIE check and sleep
+   so: parent can't miss wakeup between checking for ZOMBIE and sleeping
+   a better design might have a separate wait_lock per parent
+
+# kill() puzzle: thread X cannot just destroy thread Y
+  what if Y is executing on another core?
+    can't just free its kernel stack or user memory!
+  what if Y holds locks?
+  what if Y is in the middle of a complex update to important data structures?
+    must let it finish!
+  so: kill() can't directly destroy the target.
+
+# kill() solution: 
+  kill() sets p->killed flag, nothing else
+  the target process itself checks for p->killed
+    and calls exit() itself
+  look for "if(p->killed) exit(-1);" in usertrap()
+    not in the middle of anything here, and no locks are held
+    so it's safe to exit()
+
+# what if kill() target is sleep()ing?
+  in that case it doesn't hold locks, and isn't executing!
+  is it OK for kill() to destroy the target right away?
+  no: what if waiting for disk midway through file creation?
+
+# xv6 solution to kill() of sleep()ing process
+  see kill() in proc.c
+    changes SLEEPING to RUNNABLE -- like wakeup()
+    so sleep() will return, probably before condition is true
+  some sleep loops check for p->killed
+    e.g. piperead(), consoleread()
+    otherwise read could hang indefinitely for a killed process
+  some sleep loops don't check p->killed
+    e.g. virtio_disk.c
+    can't just quit since maybe midway through a file system update
+    not so bad since disk reads are pretty quick
+  so a kill()ed process may continue for a while
+    but usertrap() will exit() after the system call finishes
+
+# xv6 spec for kill
+  if target is in user space
+    will die next time it makes a system call or takes a timer interrupt
+  if target is in the kernel
+    target will never execute another user instruction
+    but may spend a while yet in the kernel
+
+# Next week:
+  File system
+  Midterm! during class, in this room, look at previous midterms.

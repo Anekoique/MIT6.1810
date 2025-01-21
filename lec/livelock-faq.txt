@@ -1,0 +1,196 @@
+Frequently Asked Questions for Eliminating Receive Livelock in an
+Interrupt-Driven Kernel, by Mogul and Ramakrishnan, 1996.
+
+Q: What is the livelock problem the paper is concerned with?
+
+A: Livelock occurs when packets arrive so fast that the CPU spends
+most or all of its time in the NIC interrupt handler, moving packets
+from the NIC's receive DMA ring to the software IP input queue. That
+leaves little or no CPU time to execute the thread that performs IP
+processing, and thus packets aren't moved from the IP input queue to
+the output NIC. The result is that the IP input queue grows to the
+maximum allowed length, and from then on the NIC interrupt handler
+discards most or all arriving packets.
+
+The paper's suggested solution is to disable interrupts under high
+load, and have a polling thread that directly reads packets from the
+NIC (no IP input queue), does all the IP processing, and hands the
+packets to the output NIC. This solves the livelock problem because
+there are no interrupts when the load is high, and thus no danger of
+spending too much time in the NIC interrupt handler.
+
+A NIC's first interrupt wakes up the polling thread, and after that
+interrupts are disabled for the device. The polling thread moves a
+batch of packets from the input device, through IP processing, and to
+the output devices, including all output device handling. After fully
+processing all packets in the NIC RX DMA ring, the polling thread
+re-enables interrupts and goes back to sleep.
+
+Q: What is link level processing?
+
+A: The low-level mechanisms required to send and receive packets. This
+usually includes the encoding of bits into electrical signals and
+marking the boundaries between packets.
+
+https://en.wikipedia.org/wiki/Data_link_layer
+
+Q: Section 6.4 notes that one can't use the kernel's thread scheduler
+to simulate the round robin scheduling for processing packets. Why not?
+
+A: One thing that probably wouldn't work well would be to have one
+polling thread per network interface, or one thread for sending and
+one thread for receiving, and rely on the ordinary thread scheduler to
+decide when to run each thread. Under high load the scheduler would
+only switch threads due to clock interrupts. But that might not be
+often enough -- packets arrive so fast that the input queues might
+overflow in the intervals between clock interrupts.
+
+Q: Does polling result in low latency for packet processing?
+
+A: The answer depends on how much CPU time you're willing to devote to
+polling. If the computer has nothing else to do, and thus can spend
+essentially all its time in the polling loop checking for recently
+arrived packets, then polling can deliver very low latency, lower than
+interrupts. But if the computer needs to spend time doing things other
+than the polling loop, and thus cannot check for newly arrived packets
+very often, interrupts can deliver lower latency.
+
+Q: When the network polling thread is active, will the kernel
+scheduler context-switch between it and user processes (like screend)?
+
+A: I suspect that the authors' operating system would schedule among
+kernel threads that want to run, but that kernel threads had absolute
+priority over user-level execution. And the authors were using
+uni-processors (only one core). So during times when the polling
+thread wants to run, no-user level code will run. This is one
+ingredient in the Section 6.6.1 / Figure 6-4 results: the "feedback"
+mechanism causes the polling thread to sleep, allowing the user-level
+screend program to run.
+
+Q: Will the paper's polling scheme result in discarded packets if the
+input packet rate is high?
+
+A: Yes. With the paper's polling scheme, if packets arrive too fast
+for the computer to process them, then at first the NIC hardware will
+buffer the excess packets in an internal queue, and when the NIC runs
+out of buffer space, it will start discarding incoming packets.
+
+Any design that can't keep up with the maximum possible input rate will
+have to discard packets under high load. The paper's key insight is that
+it's best to discard the excess packets at the earliest possible moment,
+to avoid wasting CPU time to partially process packets that will later
+be discarded.
+
+Q: What is screend?
+
+A: screend implements a network firewall on a router, to defend a
+local network against unwanted traffic from the larger Internet.
+
+The kernel network code shows each packet to screend, which looks at the
+packet and tells the kernel whether it's OK to forward the packet.
+screend is a user-level program (not part of the kernel), and the kernel
+maintains a queue of packets waiting for screend to look at.
+
+You can learn more here:
+
+  https://citeseerx.ist.psu.edu/document?repid=rep1&type=pdf&doi=a822dc4058040a5a3866af897d9af9f618ba83ed
+  http://bitsavers.informatik.uni-stuttgart.de/pdf/dec/tech_reports/NSL-TN-2.pdf
+
+Q: Computers are much faster now than in 1996. Has that made livelock
+problems go away?
+
+A: Faster CPUs only help if the CPU is so fast that it can handle the
+peak load that the network can deliver. But networks have gotten
+faster about as fast as CPUs have gotten faster, so we're still in a
+situation where it's pretty easy for network traffic to overwhelm a
+computer.
+
+On the other hand, this paper caused O/S designers to take steps to
+avoid livelock. For example, Linux's NAPI is an adaptive polling
+scheme inspired by the livelock paper:
+
+  https://www.usenix.org/legacy/publications/library/proceedings/als01/full_papers/jamal/jamal.pdf
+  https://lwn.net/Articles/833840/
+
+Some hardware improvements have helped as well. Modern NICs implement
+"interrupt moderation" which can limit the rate at which they generate
+interrupts (regardless of packet arrival rate). And modern CPUs have
+multiple cores, which makes polling easier (one core can poll while
+others do other work).
+
+Q: What are flow-controlled and non-flow-controlled protocols?
+
+A: A flow-controlled protocol, such as TCP, allows a sender to send
+new data only when the receiver indicates it is ready. Livelock is
+less likely with flow-controlled protocols: if the receiver can't keep
+up due to high packet arrival rate, it will automatically stop asking
+the sender for new data, and the sender will stop sending.
+
+Non-flow-controlled protocols don't have this feedback from receiver
+to sender: the sender keeps sending at whatever rate it chooses
+regardless of what happens at the receiver. Some real-time audio and
+video streaming protocols work this way. So even if the receiver is
+experiencing overload and livelock, the sender won't slow down.
+
+Q: The author's proposed design seems like it will discard packets if
+the input rate is too high. Isn't that bad for the applications
+sending network data?
+
+A: Yes, if a router drops more than a small fraction of packets,
+higher-level protocols and applications will likely behave badly. A
+reliable protocol like TCP will detect the lost packets after a timeout
+and re-send them; the receiver will experience these timeout delays; and
+the re-sends increase the load on the router even more. Protocols that
+don't re-transmit will experience other problems if there is significant
+packet loss (e.g. audio drop-outs).
+
+Network operators try to ensure that the components of the network
+(routers, links, &c) are fast enough to handle ordinary high loads, in
+order to avoid the need to discard packets.
+
+However, there are always surprises: for example, some new application
+might suddenly become popular (the Web, long ago; streaming audio;
+streaming video) that places unexpected high loads on the network. In
+the long run, the network operator probably has to buy
+higher-performance equipment. In the short run, it matters how the
+network handles sudden overload. Overload inevitably results in
+discarded packets, even in a system without livelock or other similar
+problems. But it's best to only discard to the extent that's needed to
+reduce the packet rate to what the network and routers can handle. The
+livelock problem that the paper addresses is that *more* was being
+discarded than necessary.
+
+Q: What kind of NIC is used in the paper's measurements?
+
+A: The NIC is the "AMD LANCE". The LANCE is similar to the e1000 from
+the net lab, with RX and TX DMA descriptor rings. By default, like the
+e1000, it interrupts whenever packets arrive, and whenever the NIC has
+finished sending an outgoing packet.
+
+Q: The paper says that it's best to discard packets as early as
+possible. How does the paper's design decide which packets to drop?
+
+A: The paper's design, in Section 6.4, does not explicitly decide when
+to drop packets.
+
+Instead, the Section 6.4 design processes packets as fast as it can.
+If packets arrive at a higher rate than the software can process them,
+the software cannot empty the NIC's receive DMA ring fast enough. So
+the DMA ring is often full. In that situation, the NIC discards
+incoming packets, and the software never sees them.
+
+The nice thing about the NIC discarding the excess packets is that those
+packets don't consume CPU time, and thus don't cause livelock.
+
+Ideally a router would make explicit drop decisions, for example
+preferentially dropping the lowest-priority or least-important packets.
+This is possible when the bottleneck causing the drops is a slow output
+link, and there is enough CPU time to look at all the incoming packets.
+But the paper is exploring situations where the load is so high that the
+router does not have enough CPU time to look at all the packets, and
+thus cannot make clever drop decisions.
+
+Modern NICs are fairly programmable, and support multiple DMA rings, and
+can be told to put different kinds of received packets on different DMA
+rings. A clever router could use this to prioritize traffic under
+overload.

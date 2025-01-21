@@ -1,0 +1,382 @@
+6.1810 2024 Lecture 15: Linux ext3 crash recovery
+
+This lecture: a case study of logging in Linux's ext3 file system
+  with an eye to performance and real-world design details
+
+Review: why do we care about logging?
+  crash recovery for on-disk file-system data structures
+  ideas widely used e.g. in databases and distributed systems
+    "log" == "journal"
+  lots to chew on for performance and correctness
+
+Review: the problem
+  [diagram: FS tree on disk, free bitmaps]
+  FS on disk is a complex data structure -- a tree
+  Crash while updating can leave it permanently broken, if not repaired
+  e.g. file append, add block to i-node, mark block non-free
+    if crash w/o repair, that block can be allocated for a 2nd file!
+  why crashes are threatening:
+    crash w/o repair can leave file system permanently broken
+    typically seemingly OK but with mystery problems that will
+      surface later
+  the bad pattern: an update that involves writing multiple disk
+    blocks, and crash occurs after some but not all writes
+
+Review: the basic idea of logging (both ext3 and xv6)
+  [diagram: cached blocks, FS on disk, log on disk]
+  the goal:
+    make system calls ("operations") atomic w.r.t. crashes, after recovery
+    atomic = all-or-nothing
+  system calls initially only write the block cache, not disk
+  when system call is done -- commit:
+    1. write all updated blocks to log on disk
+    2. then mark on-disk log as committed (i.e. contains all of operation's writes)
+    3. then write blocks to home locations in FS
+  recovery after crash+reboot:
+    if log marked as committed, copy blocks from log to home locations
+    otherwise, ignore log
+
+Review: two critical rules
+  write-ahead rule:
+    don't start home FS writes until all writes committed in log on disk
+    i.e. don't start modifying FS until *all* the operation's
+         writes are in the log, so the operation can be completely
+         finished if there's a crash+reboot.
+  freeing rule:
+    don't erase/overwrite log until all home FS writes are done
+
+ext3 is the modern name of the file system in today's reading
+  for many years ext3 was the main Linux FS
+  modern ext4 similar to ext3
+
+ext3 has higher performance than xv6:
+  better asynchrony and batching
+    xv6: usually log commit per syscall; and syscall waits
+    ext3: syscalls rarely have to wait for log writes; many per xaction
+          batching allows write absorbtion, thus fewer writes
+  ordered data mode:
+    does not write file content to journal, so only written once
+
+ext3 data structures:
+  [cache, info, disk FS tree, disk log]
+  in memory:
+    write-back block cache
+    current xaction info:
+      sequence #
+      block #s to be logged
+      outstanding "handles" -- one per syscall
+    prev xaction info...
+  on disk:
+    FS
+    circular log -- in a special pre-allocated fixed-size file.
+
+the ext3 log can hold multiple transactions
+  |SB: offset+seq#| ... |D4|...blocks...|C4|D5|...
+  log superblock: log offset and seq # of earliest valid transaction
+    (this is not the FS superblock; it's a block at start of log file)
+  descriptor blocks: magic, seq, block #s
+  data blocks (as described by descriptor)
+  commit blocks: magic, seq
+
+an ext3 transaction reflects updates of many syscalls -- a "compound" transaction
+  ext3 "batches" updated blocks from many system calls into each transaction
+  ext3 commits the current "open" transaction every few seconds
+
+ext3's batching reduces time spent writing the log:
+  1. spreads fixed transaction costs over many system calls
+     fixed costs: descriptor and commit blocks, seek/rotate, syscall barrier
+  2. "write absorbtion"
+     many syscalls in the batch may modify the same block, in cache
+       e.g. an app creating many files in the same directory
+     thus one disk write for many syscalls' updates
+
+ext3 also gets performance from two kinds of concurrency:
+  1. multiple system calls can add to the current transaction
+  2. multiple transactions may be at various stages:
+     * one "open" transaction that's accepting new syscalls 
+     * committing transactions doing their log writes
+     * committed transactions writing to home locations in FS on disk
+
+ext3 syscalls are "asynchronous"
+  they write cached blocks, and return -- fast!
+  they do not wait for log write or commit
+  multiple transactions is necessary for this asynchrony
+    to allow syscalls to proceed without waiting for prev transaction to commit
+    batching -> big transactions -> take a long time to commit
+
+a crash may "forget" the last few seconds of operations
+  even if the system calls completed and returns
+  b/c system calls return before effects are committed to disk
+  and transactions are committed only every few seconds
+  why? to allow batching lots of operations into each transaction.
+
+careful applications need to be aware that crash may lose last few ops
+  databases, mail systems, editors, &c
+  need some combination of careful writing and post-crash recovery
+    but at the application layer, to ensure application invariants
+  e.g. databases layer their own logging on top of FS
+    and call fsync() to enforce their own ordering rules
+
+main goals of logging:
+  1. protect FS's own invariants despite crash
+     e.g. a block cannot be both free and used in an i-node
+  2. high performance
+  but *not* to provide application-level transactions!
+
+kernel implementation of ext3 system calls:
+  sys_unlink() {
+    h = start()
+    get(h, block #) ...
+    modify the block(s) in the cache
+    stop(h)
+  }
+  start():
+    tells the logging system about a new system call
+      can't commit until all start()ed system calls have called stop()
+    start() may decide to close current xaction, start a new one
+  get():
+    tells logging system we'll modify cached block
+      added to list of blocks to be logged in current transaction
+  stop():
+    stop() does *not* cause a commit
+    transaction can commit iff all included syscalls have called stop()
+
+note: syscalls update cached blocks, but do not add to log
+
+note: syscalls lock i-nodes &c, not shown here, to prevent conflicting updates
+
+committing a transaction to disk
+  (this happens in the background)
+  1. start blocking any new syscalls
+  2. wait for in-progress syscalls to stop()
+  3. open a new transaction, unblock new syscalls
+  4. write descriptor to on-disk log w/ list of block #s
+  5. write modified blocks from cache to on-disk log
+  6. wait for descriptor and data log disk writes to finish
+  7. write the commit record to on-disk log
+  8. wait for the commit disk write to finish
+  9. now modified blocks allowed to go to homes on disk (but not forced)
+     though only after all previous transactions have committed too
+
+when can ext3 re-use log space?
+  log is circular: SB T4 T5 T2 T3
+  a transaction's log space can be re-used if:
+    it's the oldest transaction in the log -- T2 in this case
+    T2 has committed
+    T2's blocks have all been written to home locations in FS on disk
+      ==> no longer any need to replay from log after a crash
+  before re-use, must write log superblock with
+    offset/seq of now-oldest transaction in log (T3)
+
+"freeing" a transaction in the log means noting that the space
+  can be re-used and advancing SB seq/offset over it.
+  (*not* putting the blocks in the FS free bitmap).
+
+what if a crash?
+
+what kinds of crashes can logging help with?
+  "fail-stop"
+  followed by reboot
+  e.g. power failure, then power restored
+  crash causes RAM (and thus cached disk blocks) to be lost
+  disk h/w is assumed to be readable after restart
+    and to reflect all *completed* writes up to the time of the crash
+    and perhaps some writes that were in-progress at time of crash
+    at sector granularity (i.e. no partial sector writes)
+  logging does *not* help with non-fail-stop failures
+    e.g. bugs/errors in FS code, disk firmware or medium, CPU, RAM
+
+after a crash,
+  on-disk log may have a bunch of complete xactions, then some partial
+  may also have written some of block cache to disk before crash
+    i.e. FS *partially* updated, not safe to use
+    e.g. file i-node has new block, but bit not cleared in free bitmap
+         or new directory entry refers to i-node, but i-node not initialized
+
+how ext3 recovery works
+  SB T8 xT5 T6 T7
+    SB points to T6
+    T8 has overwritten start of T5
+  0. reboot with intact disk
+  1. look in log superblock for offset and seq# at which to start
+  2. find the end of the log
+     scan forward over valid transactions
+       descriptor/commit pairs with correct magic and seq #
+     end of log is xaction before first invalid xaction
+  3. write all blocks to homes, through end of log, in log order
+     thus completing those partially-written operations
+  4. start normal file-system operation
+
+write-ahead rule ensures that transactions after last committed
+  cannot have started writing any home locations, so after
+  recovery it will be as if they never happened.
+
+why does recovery write log blocks to homes in log order?
+  to ensure newer block versions replace older ones
+
+what if block after last valid commit block looks like a log descriptor?
+  i.e. looks like the start of the next transaction?
+  perhaps some file data happens to look like a descriptor?
+    ext3 prevents this from happening
+    ext3 replaces magic number in data blocks in journal with zero
+    and sets a flag for that block in the descriptor
+  perhaps a descriptor block left over from an old freed transaction?
+    seq # will be too low -> end of log
+
+what if another crash during log replay?
+  after reboot, recovery will replay exactly the same log writes
+
+that was the straightforward part of ext3.
+  there are also some tricky details!
+
+why does ext3 delay start of T2's syscalls until all of T1's syscalls finish?
+  i.e. why this:
+    T1: |-syscalls-|
+    T2:             |-syscalls-|
+              ---time--->
+  this barrier sacrifices some performance
+  example problem that this barrier prevents:
+    T1: |-create(x)-|
+    T2:        |-unlink(y)-|
+                       X crash
+              ---time--->
+  if we allow T2's unlink while T1's create is executing
+    unlink(y) free y's i-node -- i.e. marks it free in block cache
+    create(x) may allocate that same i-node -- i.e. read unlink's write
+  if T1 commits, but crash before T2 commits, then
+    y will exist (the unlink did not commit)
+    x will exist but use the same i-node as y!
+  we can't let T1 see T2's updates!
+    so: don't start T2's syscalls until T1's syscalls are done
+  (note ext3's copy-on-write doesn't fix this: it gives T1
+   a copy of all blocks as of the end of T1, but T2's unlink
+   executed before T1 ended.)
+  (note we can't give T2 its own copies of the blocks, separate from
+   T1's copies, since generally we do want later system calls to
+   see the effects of earlier system calls.)
+    
+why commit needs to write on-disk log from a snapshot of cached blocks
+  consider this:
+  T1: |--create(d/f)--|   ... T1's log writes ...
+  T2:                   |--create(d/g)--|
+  both create()s write d's directory content block
+  suppose T1 writes log to disk *after* T2's create()
+  we can't let T1 include some of T2's writes!
+    then a crash+recovery might replay some but not all of T2
+    e.g. make the directory entry d/g but without initializing g's i-node
+  ext3's solution:
+    give T1 a private copy of the block cache as it existed when T1 closed
+    T1 commits from this snapshot of the cache
+    it's efficient using copy-on-write
+    the copies allow syscalls in T2 to proceed while T1 is committing
+
+so far we've been talking about EXT3's "journaled data" mode
+  in which file content blocks are written to log
+  as well as meta-data (i-nodes, directory content, indirect blocks, free bitmaps)
+  so file content is included in atomicity guarantee
+
+logging file content is slow, every data block written twice to disk
+  data is usually much bigger than meta-data
+  can we entirely omit file content from the log?
+  if we did, when would we write file content to the FS?
+
+can we write file content blocks after committing write() meta-data to log?
+  no: if metadata is committed first, crash may leave i-node pointing
+      to blocks from someone else's deleted file, with deleted
+      file's content!
+
+ext3 "ordered data" mode:
+  write file content blocks to disk *before* commiting log
+  (and don't write file content to the log)
+  thus, for a write():
+    1. write file content blocks to FS on disk,
+    2. wait until content writes finish,
+    3. commit i-node (w/ block numbers and new size) and block free bitmap
+  if crash after data write, but before commit:
+    block on disk has new data
+    but not visible, since i-node not updated w/ new block
+    no metadata inconsistencies
+      neither i-node nor free bitmap were updated, so blocks still free
+  most people use ext3 ordered data mode
+    it's much faster: avoids writing data twice
+
+why does it make sense for the log to omit file content?
+  again, goal of the log is to protect FS's own invariants
+  from this point of view, file content is not relevant.
+
+correctness challenges w/ ordered data mode:
+  * 1. rmdir() frees directory content block, #27
+    2. file write() (in same compound xaction) allocates block #27
+    3. write() writes block #27 on disk
+    4. crash before rmdir is committed
+    after recovery, as if rmdir never happened,
+      but directory content block (#27) has been overwritten!
+    fix: no re-use of freed block until freeing syscall committed
+  * rmdir, commit, re-use block in file, ordered file write, commit,
+      crash+recover, replay rmdir
+    1. rmdir
+       erases "." and ".." in content block 28, which is logged
+       then frees 28
+    2. rmdir commits
+    3. write() allocates 28, and writes it (with ordered data mode)
+    4. write commits
+    5. crash, reboot, log is replayed, including the rmdir's write
+       but write()'s data write was not logged, not replayed
+    result: file is left w/ directory content
+    fix: add "revoke" log record when freeing dir block,
+         prevents *prior* log records from writing that block.
+  note: both problems due to changing the type of a block (content vs meta-data)
+    so another solution might be to never change a block's type
+
+what if there's not enough free log space for a transaction's blocks?
+  free oldest transaction(s)
+  i.e. install its writes in the on-disk FS
+
+what prevents so many syscalls starting that log isn't big enough?
+  each syscall passes max number of blocks needed to start()
+  start() waits if total for current transaction is too high
+    and works on freeing old transactions
+
+another (complex) reason for reservations:
+  T1 updates block 17
+  T1 commits
+  T1 finishes writing its log and commit record
+     but has not yet written block 17 to home location
+  T2 also updates block 17 in the cache
+  a T2 syscall is executing, does a write for which no log space
+  can ext3 install T1's blocks to home locations on disk,
+    and free T1's log space?
+  no: the cache no longer holds T1's version of block 17
+    (ext3 could read the block from the log, but it doesn't)
+  but once T2 commits, logged block 17 will reflect T1's writes
+    so freeing of T1 can just wait for T2 to commit
+  that is, freeing of early transactions may have to wait for
+    commit of later transactions
+
+this means any transaction (T2) *must* be able to commit without
+  having to wait for freeing of earlier transaction (T1)
+  log space reservations help ensure this
+
+checksums
+  recall: transaction's log blocks must be on disk before writing commit block
+    ext3 waits for disk to say "done" before starting commit block write
+  risk: disks usually have write caches and re-order writes, for performance
+    sometimes hard to turn off (the disk lies)
+    people often leave re-ordering enabled for speed, out of ignorance
+    bad news if disk writes commit block before the rest of the transaction
+  solution: commit block contains checksum of entire logged transaction
+    on recovery: compute checksum of transaction
+	if matches checksum in commit block: install transaction
+    if no match: don't install transaction
+  ext4 has log checksumming, but ext3 does not
+
+next week
+  no class next week
+  then: creative uses of virtual memory at application level
+
+References:
+Stephen Tweedie 2000 talk transcript "EXT3, Journaling Filesystem"
+  http://olstrans.sourceforge.net/release/OLS2000-ext3/OLS2000-ext3.html
+log format details
+  https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout
+https://www.usenix.org/system/files/login/articles/04_tso_018-021_final.pdf

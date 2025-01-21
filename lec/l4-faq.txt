@@ -1,0 +1,175 @@
+Frequently Asked Questions about micro-kernels and L4
+
+Q: How do people use micro-kernels today?
+
+A: Microkernels are sometimes used in embedded situations, e.g.
+controlling the radio hardware in a cell phone, or moving packets
+around in a network router. You can read about how L4 is used here:
+
+  https://en.wikipedia.org/wiki/L4_microkernel_family
+
+Q: Why aren't micro-kernels more commonly used?
+
+A: Why some promising technologies become popular and others don't is
+not always clear! But here are some guesses
+
+One reason is that traditional operating systems are mature and have
+lots of useful software available for them: editors, window systems,
+databases, network protocols, web servers, image-processing libraries,
+&c. Much of this software would require significant effort to port to
+a micro-kernel. Another reason is that the advantages of micro-kernels
+may not be compelling enough for some people to motivate them to
+switch, and go to the expense of moving to a new environment. Another
+reason is that traditional operating systems adopted many of the good
+ideas from micro-kernels, such as IPC and flexible virtual memory.
+
+The fact that many micro-kernel-based systems provided UNIX
+compatibility by running a complete UNIX kernel, as in the L4+Linux
+paper, was probably viewed by some as undermining much of the original
+justification for micro-kernels.
+
+Q: Why did people pursue micro-kernel projects like L4?
+
+A: L4 is the result of a research project that started in the early
+1990s, one of many micro-kernel projects at that time. The people who
+worked on these projects felt that traditional kernels (e.g. Linux)
+were too complex, and hoped to design much simpler kernels. The
+general approach was to try to eliminate all but the absolutely
+necessary functions from the kernel, moving code that didn't need to
+be there into user-space server processes (e.g. for device drivers,
+file systems, network protocols, &c), which would interact via IPC
+messages. The hoped-for benefits:
+
+  * fewer kernel bugs, since the kernel would be simpler.
+  * better security, because it might be easier to reason about
+    the security of a smaller kernel, and because bugs in
+    user-level services might be less damaging than bugs in
+    the kernel.
+  * better performance, because it might be possible to optimize
+    a simple kernel more effectively than a complex kernel.
+  * easier to modify and extend the operating system, since
+    perhaps one could replace or modify user-level services more easily
+    than kernel code.
+  * more robust in the face of software failures: since most of
+    the operating system would exist in user-level services,
+    if one failed, it could be re-started without rebooting
+    the whole computer.
+  * a more elegant design.
+
+Q: Why does the paper focus on IPC performance?
+
+A: This paper was part of a larger debate in the academic computer
+science world about how kernels should be designed. Initial work on
+micro-kernels seemed compelling due to their simplicity; then people
+realized that the initial designs were slow due to lots of IPC, and
+started to think microkernels were a bad idea; then the L4 authors
+made IPC a lot faster and published this paper (among others) to try
+to persuade people not to ignore micro-kernels on account of low
+performance.
+
+Q: Would a micro-kernel based system likely be more secure than
+one based on a monolithic kernel?
+
+A: Perhaps. It's true that typical monolithic kernels contain large
+amounts of code that don't fundamentally need to execute with full
+hardware permissions, and thus don't really need to be in the kernel.
+Moving such code to user space might reduce potential security and
+reliability problems if the code has bugs (as, inevitably, it often
+does). There's been a fair amount of research into moving
+functionality out of the kernel, e.g. into user-level device drivers.
+Here's an example based on a microkernel:
+
+  https://www.minix3.org/docs/jorrit-herder/osr-jul06.pdf
+
+This approach seems promising for device drivers, file systems, and
+network protocols, since they tend to be self-contained and have
+well-defined interfaces. But it has proved more difficult for other
+parts of the kernel.
+
+A limitation here is that many bugs are equally a problem whether they
+occur in user space or in the kernel. If your disk driver has a bug that
+causes it to sometimes read or write the wrong block on the disk, moving
+the driver to user space is not likely to help. Or if your file system
+sometimes doesn't enforce file permissions correctly, that's a security
+problem that's equally threatening whether the file system code is in
+the kernel or in user space. If your TCP implementation has a buffer
+overflow bug that allows an attacker to inject and execute their own
+code remotely, then the attacker may be able to read or modify your
+network traffic even if the TCP code runs in user space.
+
+Q: Is it easier to develop operating system code for a micro-kernel
+than for a monolithic kernel?
+
+A: It seems easier to implement things in a monolithic kernel than in
+a micro-kernel-based system in which the functionality is split among
+many user-level servers. Different modules in a monolithic kernel can
+easily look at each others' data and call each others' functions. Such
+interaction is more painful when the modules are in different user
+processes interacting with IPC.
+
+As a result, for example, even though today's reading involves a
+microkernel, most of the paper's O/S functionality is in a single
+monolithic user-level server, the Linux server.
+
+Q: What is the small-address-space optimization?
+
+A: L4 uses the following clever trick to avoid having to switch page
+tables and thus flush the TLB when it is context-switching from one
+task to another (or switching between L4 kernel and a user-level
+task). Instead of giving each task a separate page table, L4 has just
+one page table, and maps each task to a different range of virtual
+addresses in that page table. Thus all the tasks (and the L4 kernel)
+are in the page table at the same time.
+
+This only works on Intel x86 processors, which had (in addition to page
+tables) a feature called "segments" which allow the kernel to change the
+base offset in virtual address space that address zero refers to, and
+also to restrict the maximum virtual address that a user process can
+refer to. So when switch to a task, L4 would adjust the segment
+registers to cause address zero to refer to that task's virtual address
+range in the single page table.
+
+This trick only works if processes are smallish (e.g. <= hundreds
+of megabytes) because the authors were using a 32-bit computer with
+32-bit virtual addresses. 32 bits gets you only 4 gigabytes of virtual
+address space, so the trick relies on individual tasks being much less
+than 4 gigabytes, so that they can all fit into 4 gigabytes.
+
+Q: What's a tagged TLB?
+
+A: A non-tagged TLB is indexed by virtual address; when you switch
+address spaces, which changes the meaning of virtual addresses, the
+TLB content is no longer correct and must be deleted.
+
+A tagged TLB associates an address space identifier (ASID) with each
+entry, as well as a virtual address. The operating system allocates a
+different ASID to each process. The result is that the TLB can keep
+multiple mappings for any given virtual address, a separate mapping for
+each process. So you don't have to flush the TLB when switching address
+spaces.
+
+Q: Why does L4+Linux perform better in the paper's benchmarks than the
+architecturally similar Mach+Linux?
+
+A: The paper does not explain. One possibility is that L4's
+small-address-space optimization may be greatly decreasing
+context-switch costs.
+
+Q: What are micro and macro benchmarks?
+
+A: People use "micro-benchmark" to refer to a benchmark that attempts
+to isolate and measure the performance of a single simple operation,
+for example the cost of entering or leaving the kernel. Such
+benchmarks are nice because it's often easy to understand exactly what
+they are measuring, and attribute the results to specific design and
+implementation decisions.
+
+However, real-world applications are complex mixes of lots of different
+operations, so it is hard to predict real-world performance from
+micro-benchmarks.
+
+As a result, people also use "macro-benchmarks" consisting of entire
+applications, e.g. compiling the Linux kernel. These are more
+representative of the performance you'd really observe, but it's also
+often hard to understand why macro-benchmarks get the performance they
+do.

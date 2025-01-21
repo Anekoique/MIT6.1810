@@ -1,0 +1,366 @@
+6.1810 2024 Lecture 5: System Call Entry/Exit
+
+Today: user -> kernel transition
+  system calls, exceptions, device interrupts enter the kernel in the same way
+  lots of careful design and important detail
+  important for isolation (security) and performance
+
+What needs to happen when a program makes a system call, e.g. write()?
+  [CPU | user/kernel diagram]
+  CPU resources are set up for user execution (not kernel)
+    32 registers (incl sp), pc, privilege mode, satp
+  what needs to happen?
+    switch to supervisor mode
+    save 32 user registers and pc
+    switch to kernel page table
+    switch to kernel stack
+    jump to kernel C code
+  additional goals
+    don't let user code interfere with user->kernel transition
+      e.g. don't execute user code in supervisor mode!
+    transparent to user code -- resume without disturbing
+      most important for device interrupts
+
+Today I'll focus on the user/kernel transition
+  and ignore what the system call implemenation does once in the kernel
+
+preview:
+  write()                        write() returns
+  ecall                                                     User
+  ----------------------------------------------------------------
+                                 sret                       Kernel
+  uservec in trampoline.S        userret in trampoline.S  
+  usertrap() in trap.c           usertrapret() in trap.c
+  syscall() in syscall.c           ^
+  sys_write() in sysfile.c      ---|
+
+let's watch an xv6 system call entering/leaving the kernel
+  xv6 shell writing its $ prompt
+  user/sh.c line 137: write(2, "$ ", 2);
+  user/usys.S line 29
+    this is the write() function, still in user space
+  a7 tells the kernel what system call we want -- SYS_write = 16
+  ecall -- triggers the user/kernel transition
+
+let's start by putting a breakpoint on the ecall
+  user/sh.asm
+  search for <write>:
+  write()'s ecall is at address 0xc24
+
+$ make qemu-gdb
+$ gdb
+(gdb) b *0xc24
+(gdb) c
+(gdb) delete 1
+(gdb) x/3i 0xc22
+
+let's print the registers
+(gdb) p $pc
+(gdb) p $sp
+$pc and $sp are at low addresses -- user memory starts at zero
+
+C on RISC-V puts function arguments in a0, a1, a2, &c
+write() arguments: a0 is fd, a1 is buf, a2 is n
+(gdb) p $a0
+(gdb) p/x $a1
+(gdb) x/s $a1
+(gdb) p $a2
+
+the shell is printing the $ prompt, as we expected
+
+what page table is in use?
+  (gdb) p/x $satp
+        not very useful
+  qemu: control-a c, info mem
+    there are mappings for seven pages
+    [address space diagram -- 3.4.pdf]
+    instructions x2, data, stack guard (no PTE_U), stack
+    then two high pages: trapframe and trampoline
+      data and code for user->kernel transition
+    there are no mappings for kernel memory, devices, physical mem
+
+let's execute the ecall
+
+(gdb) stepi
+
+where are we?
+  (gdb) p $pc
+        a very high virtual address
+  qemu: info mem
+        we're still using the user page table
+        $pc is in the very last page
+  (gdb) x/6i $pc
+        this is uservec in kernel/trampoline.S
+        it's the start of the kernel's trampoline trap handling code
+  (gdb) p $sp
+  (gdb) p $a0
+        the registers hold user values (except $pc)
+
+trampoline:
+  holds the very first instructions executed as supervisor for trap
+  must be in user page table, since ecall doesn't change satp.
+  at the top to avoid punching a hole in user virtual address space.
+  protected: no PTE_U flag.
+
+can we tell that we're in supervisor mode?
+  I don't know a way to find the mode directly
+  but observe $pc is executing in a page with no PTE_U flag
+    lack of crash implies we are in supervisor mode
+
+how did we get here?
+  ecall did four things:
+    change mode from user to supervisor
+    save $pc in $sepc
+      (gdb) p/x $sepc
+    jump to $stvec (i.e. set $pc to $stvec)
+      (gdb) p/x $stvec
+      the kernel previously set $stvec, before jumping to user space
+    disable (really postpone) further interrupts
+      (gdb) p/x $sstatus
+      SIE 0x2 is clear (the 0x20 is SPIE -- previous)
+
+note: ecall lets user code switch to supervisor mode
+  but ecall also sets $pc = $stvec
+  so the kernel immediately gains control, since only it can set $stvec
+  so the user program itself can't execute as supervisor
+
+what needs to happen now?
+  we can't execute kernel C code yet...
+  * save the 32 user register values (for later transparent resume)
+  * switch to kernel page table
+  * set up stack for kernel C code
+  * jump to kernel C code -- usertrap()
+
+why didn't the RISC-V designers have ecall do these things for us?
+  to give O/S designers scope for very fast syscalls / exceptions / intrs
+    maybe O/S can handle some traps w/o switching page tables
+    maybe we can map BOTH user and kernel into a single page table
+       so no page table switch required
+    maybe some registers do not have to be saved
+    maybe no stack is required for simple system calls
+  so ecall does as little as possible
+
+can we just write the 32 registers somewhere convenient in physical memory?
+  no, even supervisor mode is constrained by the page table
+  and the current page table is still the user page table, not kernel
+
+can we first set satp to the kernel page table?
+  supervisor mode is allowed to set satp...
+  but we don't know the address of the kernel page table at this point!
+
+we need one of the 32 general purpose registers to hold an address
+  of the memory into which we'll save the 32 user registers
+  but all 32 hold user values which we must preserve for eventual return
+
+two parts to the solution for where to save the 32 user registers:
+  1) xv6 maps a 2nd kernel page, the trapframe, into the user page table
+     at a known virtual address, always the same: 0x3fffffe000
+     trapframe has space to hold the saved registers
+     the kernel gives each process a different trapframe page
+     see struct trapframe in kernel/proc.h
+     (but we still need a register to hold the trapframe's address...)
+  2) RISC-V provides the sscratch register
+     supervisor code can use sscratch for temporary storage
+     user code isn't allowed to use sscratch, so no need to save
+
+see this at the start of uservec in trampoline.S:
+  csrw sscratch, a0
+then load TRAPFRAME into a0
+
+(gdb) stepi
+(gdb) p/x $sscratch
+      0x2, the old first argument (fd)
+(gdb) stepi
+(gdb) stepi
+(gdb) stepi
+(gdb) p/x $a0
+      address of the trapframe in the user address space
+
+now uservec() has 32 saves of user registers to the trapframe, via a0
+  so they can be restored later, when the system call returns
+  let's skip them
+
+(gdb) b *0x3ffffff07e
+(gdb) c
+
+now we're setting up to be able to run C code in the kernel
+  couldn't before this, since C code would have overwritten
+  user registers and stack; thus trampoline is assembler.
+first a stack
+  previously, kernel put a pointer to top of this process's
+    kernel stack in trapframe
+  look at struct trapframe in kernel/proc.h
+  "ld sp, 8(a0)" fetches the kernel stack pointer
+  remember a0 points to the trapframe
+  recall at this point the only kernel data mapped in the page table
+    is the trapframe, so everything has to be loaded from there.
+
+(gdb) stepi
+
+retrieve hart ID into tp
+
+(gdb) stepi
+
+we want to jump to the kernel C function usertrap(), which
+  the kernel previously saved in the trapframe.
+  "ld t0, 16(a0)" fetches it into t0, we'll use it in a moment,
+    after switching to the kernel page table
+
+(gdb) stepi
+
+load a pointer to the kernel pagetable from the trapframe into t1,
+then load it into satp, and issue an sfence to clear the TLB.
+
+(gdb) stepi
+(gdb) stepi
+(gdb) stepi
+
+why isn't there a crash when satp is changed?
+  after all we just switched page tables while executing!
+  answer: the trampoline page is mapped at the same virtual address
+    in the kernel page table as well as every user page table
+
+(gdb) p $pc
+qemu: info mem
+
+with the kernel page table we can now use kernel functions and data
+
+the jr t0 is a jump to usertrap() (using t0 retrieved from trapframe)
+
+(gdb) p/x $t0
+(gdb) p usertrap
+(gdb) stepi
+(gdb) layout src
+
+we're now in usertrap() in kernel/trap.c
+  all traps from user-space follow the path we've just seen
+  system calls, device interrupts, exceptions
+
+Q: what if a device interrupt occurs while executing in the trampoline code?
+
+usertrap() looks in the scause register to see the trap cause
+  (gdb) p $scause
+  what is 8?
+  page 97 of riscv-privileged-X.pdf
+  scause = 8 is a system call ("Environment call from U-mode")
+
+(gdb) next ... until syscall()
+(gdb) step
+(gdb) next
+
+now we're in syscall() kernel/syscall.c
+myproc() uses tp to retrieve current struct proc *
+p->xxx is usually a slot in the current process's struct proc
+
+syscall() retrieves the system call number from saved register a7
+  p->trapframe points to the trapframe, with saved registers
+  p->trapframe->a7 holds 16, SYS_write
+  p->trapframe->a0 holds write() first argument -- fd
+  p->trapframe->a1 holds buf
+  p->trapframe->a2 holds n
+
+Q: why can't this code just look at a7? why must it look in p->trapframe?
+
+(gdb) next ...
+(gdb) p num
+
+then dispatches through syscalls[num], a table of functions
+
+(gdb) p syscalls[num]
+(gdb) next ...
+(gdb) step
+
+aha, we're in sys_write.
+at this point system call implementations are fairly ordinary C code.
+let's skip to the end, to see how a system call returns to user space.
+
+(gdb) finish
+
+notice that write() produced console output (the shell's $ prompt)
+syscall()'s p->tf->a0 assignment causes (eventually) a0 to hold the return value
+  the C calling convention on RISC-V puts return values in a0
+
+(gdb) next
+
+back to usertrap()
+
+(gdb) p p->trapframe->a0
+
+sys_write() returned 2 -- two characters -- $ and space
+
+(gdb) next
+(gdb) step
+
+now we're in usertrapret(), which starts the process of returning
+  to the user program
+
+we need to prepare for the next user->kernel transition
+  stvec = uservec (the trampoline), for the next ecall
+  trapframe satp = kernel page table, for next uservec
+  trapframe sp = top of kernel stack
+  trapframe trap = usertrap
+  trapframe hartid = hartid (in tp)
+
+at the very end, the trampoline uses the RISC-V sret instruction
+  we need to prepare a few registers that sret uses
+  sstatus -- "previous mode" field = 0 -- user mode
+  sepc -- the saved user program counter (from trap entry)
+
+we'll need to switch to the user page table
+  not OK in usertrapret(), since it's not mapped in the user page table.
+  need a page that's mapped in both user and kernel page table -- the trampoline.
+  jump to userret in trampoline.S
+
+(gdb) b 129
+(gdb) c
+(gdb) tui disable
+(gdb) step
+(gdb) x/8i $pc
+
+a0 holds user page table address
+the csrw satp switches to the user address space
+
+(gdb) stepi
+(gdb) stepi
+(qemu) info mem
+
+now 32 loads from the trapframe into registers
+  these restore the user registers
+  let's skip over them
+
+(gdb) b *0x3ffffff11a
+(gdb) c
+
+a0 is restored last, after which we can no longer get at TRAPFRAME
+
+(gdb) si
+(gdb) p/x $a0 -- the return value from write()
+
+now we're at the sret instruction
+
+sret:
+  copies sepc to pc
+  changes mode to user
+  re-enables interrupts (really copies SPIE to SIE)
+  continues at new pc...
+
+(gdb) p $pc
+(gdb) p/x $sepc
+(gdb) stepi
+(gdb) p $pc
+
+now we're back in the user program ($pc = 0xc28)
+  returning 2 from the write() function
+
+(gdb) p/x $a0
+
+and we're done with a system call!
+
+summary
+  much of the complexity is due to:
+    isolation
+    speed
+  a few design questions to ponder:
+    can an evil program abuse the entry mechanism?
+    can you think of ways to make the hardware or software simpler?
+    can you think of ways to make traps faster?

@@ -1,0 +1,307 @@
+6.1810 2024 Lecture 18: Virtual Machines, Dune
+
+Read: Dune: Safe User-level Access to Privileged CPU features, Belay et al,
+OSDI 2012.
+
+Plan:
+  virtual machines
+  trap-and-emulate virtualization
+  hardware-supported virtualization (Intel VT-x)
+  Dune
+
+*** Virtual Machines
+
+what's a virtual machine?
+  simulation of a computer, accurate enough to run an O/S
+
+diagram: h/w, host/VMM, guest linux and apps, guest Windows and apps
+  VMM might be stand-alone, or
+  VMM might run in a host O/S, e.g. Linux
+
+why VMs?
+  cloud: many customer guest "instances" on each physical machine
+    each customer can run whatever O/S &c they want in their VM
+    cloud can share each machine among many customers
+  isolation, more serious than e.g. process
+  migration, replication
+  s/w developers:
+    virtual "crash" boxes for testing (sound familiar?)
+
+VMs have a long history
+  1960s: IBM used VMs to share big expensive machines
+  1980s: (computers got small and cheap)
+         (then machine rooms got full)
+  1990s: VMWare re-popularized VMs, for x86 hardware
+  2000s: widely used in cloud, enterprise
+
+why look at virtual machines in 6.1810?
+  VMMs have much in common with O/S kernels
+  some of the most interesting action in O/S design has shifted to VMs
+  VMs have affected both O/S (above) and hardware (below)
+
+how accurate must a VM be?
+  usual goal is 100% accuracy
+    boot any guest O/S without modification
+    prevent a malicious guest from breaking out
+    guest cannot even detect if in VM!
+  in practice, VMM and O/S often cooperate for efficiency
+    e.g. VMM offers special disk/net "devices" that guest knows about
+
+we could build a VM by writing software to simulate machine instructions
+  VMM interprets each guest instruction
+  maintain virtual machine state for the guest
+    32 registers, satp, mode, RAM, disk, net, &c
+  pro: this works e.g qemu
+  con: slow
+
+idea: execute guest instructions directly on the CPU -- fast!
+  what if the guest kernel executes a privileged instruction?
+    e.g. guest loads a new page table into satp
+
+idea: run the guest kernel in user mode
+  similar to running the guest kernel as an xv6 process
+  of course the guest kernel assumes it is in supervisor mode
+  ordinary instructions work fine
+    adding two registers, function call, &c
+  privileged RISC-V instructions are illegal in user mode
+    will cause a trap, to the VMM
+  VMM trap handler emulates privileged instruction
+    maybe apply the privileged operation to the "virtual state"
+      e.g. read/write sepc
+    maybe transform and apply to real hardware
+      e.g. assignment to satp
+  "trap-and-emulate"
+  nice b/c you can build such a virtual machine entirely in software
+    perhaps one could turn xv6 into a trap-and-emulate VMM for RISC-V
+
+which guest instructions will trap?
+  csrr, csrw, ecall, sret, ld/st to device memory
+
+what virtual state does a RISC-V trap-and-emulate VMM need to keep?
+  all "privileged CPU state"
+    CPU state that the guest kernel assumes it can read/write
+    but is forbidden by user mode
+    and often must differ from "real" state
+  mode
+  all s* registers (sepc, stvec, scause, satp, &c)
+  page table
+  PLIC/CLINT
+  device hardware
+
+the RISC-V is nice w.r.t. trap-and-emulate virtualization
+  all privileged instructions trap if you try to execute them in user mode
+  not all CPUS are as nice -- 32-bit x86, for example
+    some privileged instructions don't trap; x86 ignores if run in user mode
+
+for RISC-V trap-and-emulate, what has to happen when:
+
+... guest user code executes ecall to make a system call?
+    [diagram: guest user, guest kernel, VMM, virtual state, real sepc]
+    CPU traps into the VMM (ecall always generates a trap)
+      h/w saves guest's PC in (real) sepc
+    VMM trap handler:
+      examine the guest instruction
+      virtual sepc <- real sepc
+      virtual mode <- supervisor
+      virtual scause <- 8 "system call"
+      real sepc <- virtual stvec
+      modify (real) page table -- set PTE_V for non-PTE_U entries
+      sret: return from trap (sets real mode to user)
+
+... the guest kernel reads scause, e.g. csrr a0, scause
+    trap into VMM (since csrr is a privileged instruction)
+    examine the guest instruction
+    trapframe a0 <- virtual scause
+    real sepc += 4
+    return from trap
+
+... the guest kernel executes sret (return to user)?
+    CPU traps into the VMM
+    VMM trap handler:
+      virtual mode <- user
+      real sepc <- virtual sepc
+      modify (real) page table -- clear PTE_V for non-PTE_U entries
+      return from trap
+
+... the guest kernel writes satp?
+  VMM must ensure that guest only accesses its own memory
+    and must remap guest physical addresses
+  VMM sets up a "shadow" page table derived from guest's page table
+  guest's page table:
+    guest va -> guest pa
+  vmm map for this guest
+    guest pa -> host pa
+  VMM's "shadow" page table
+    guest va -> host pa
+  VMM installs the shadow page table in the real satp
+
+... the guest kernel modifies a PTE in the active page table?
+  VMM doesn't have to do anything
+  RISC-V spec says PTE modifications don't take effect until sfence.vma
+  sfence.vma causes trap to VMM
+    VMM generates a new shadow page table
+
+how to simulate devices?
+  e.g. disk, NIC, display
+  a big challenge!
+  strategy #1: emulate a common existing real device
+    needed in order to run oblivious guest O/S
+    intercept memory-mapped control register read/write
+      by marking those pages invalid, so VMM gets page faults
+    VMM turns page faults into operations on simulated device state
+    e.g. qemu simulates uart/console for xv6
+      qemu turns uart r/w into characters to your display or ssh
+  strategy #2: special virtual device tailored for efficiency
+    requires guest O/S driver -- i.e. guest knows it's in a VM
+    can be more streamlined than trapping on control register r/w
+    e.g. xv6's virtio_disk.c; qemu turns into r/w on file fs.img
+  strategy #3: pass-through access to a real hardware device
+    guest O/S gets direct access to device h/w, no traps
+    often requires specific support in device
+      modern NICs have separate DMA ring per VM
+    can be efficient
+
+trap-and-emulate works well -- but it can be slow!
+  lots of traps into the VMM
+
+*** Hardware-supported x86 virtualization
+
+VT-x/VMX/SVM: hardware supported virtualization
+  modern Intel (and AMD) CPUs support virtualization in hardware
+    guest can execute privileged instructions without trapping!
+    can modify control registers, change page table, handle exceptions!
+    can switch to user mode, and receive system call traps
+    etc.
+  faster than trap-and-emulate, and simpler VMM software
+  widely used to implement virtual machines
+    e.g. WSL (Windows Subsystem for Linux), cloud
+
+(How can this possibly be secure?)
+
+Some terminology
+  Each CPU is in either root mode -- running the VMM i.e. host
+    or in non-root mode -- running the guest (kernel + user processes)
+    execution switches back and forth
+  VMCS (VM Control Structure) -- configuration, save/restore
+  Special instructions switch VT-x mode
+    VMLAUNCH/VMRESUME: host -> guest
+    VMCALL: guest -> host
+  Certain events also force guest->host "exit"
+
+What must VT-x prevent the guest from doing, given access to privileged state?
+  read/write outside its own memory
+  talk to hardware devices, or grab interrupts
+  interfere with VMM host's control register setup
+
+EPT (extended page table) constrains guest memory access
+  problem:
+    we want to let the guest kernel control its own page table,
+    we also want to restrict the guest to just its allowed physical memory,
+  MMU has *two* layers of address translation in VT-x guest mode
+    first, %cr3 page table maps guest va -> guest pa (as usual)
+    second, EPT maps guest pa -> host pa
+  VMM sets up EPT to have only mappings for guest's own memory
+  guest cannot see or change the EPT
+  so:
+    guest can freely read/write %cr3, change PTEs, read D bits, &c
+    VMM can still provide isolation via EPT
+  CPU delivers page faults from ordinary (%cr3) page table to guest
+  page faults from EPT force exit to host -- guest does not see them
+
+Device and timer interrupts
+  CPU forces exit from guest, delivers interrupts to host
+
+the VMCS memory area holds saved host state
+  VMLAUNCH and VMRESUME save all of host privileged state (registers &c)
+  and restore all of guest's (previously saved) state
+  exit from guest to host restores host's state
+    so guest cannot disturb host's privileged state
+
+Thus: if the host configures things properly, the guest cannot escape
+
+Hardware virtualization is widely used, e.g. in the cloud.
+
+*** Dune
+
+the big idea:
+  use VT-x to run a Linux process (rather than to run a guest kernel)
+  then application code has fast direct access to page tables, page faults, &c
+  to allow user code to efficiently:
+    sandbox untrusted code
+    modify page table and take page faults
+
+the scheme
+  [linux, dune module, process]
+  Dune is a "loadable kernel module" for Linux
+  an ordinary process can switch into "Dune mode"
+  a Dune-mode process is still a process
+    has memory, can make Linux system calls (via VMCALL)
+  the isolation machinery is a little different
+    VT-x guest supervisor mode
+    memory protection via EPT page table
+  Dune gives a process additional functionality
+    read and write its own page table, including PTE D (dirty) bit
+      faster than Linux mprotect() system call
+    handle its own page faults
+      faster than having Linux turn fault into upcall to signal handler
+    switch into (guest) user mode, for sandboxing
+      guest user mode can only use guest PTE_U addresses
+      and cannot use privileged instructions/registers
+    process can intercept (guest) user system calls, page faults
+
+Example: sandboxed execution (paper section 5.1)
+  suppose your web browser wants to run a 3rd-party plug-in
+    e.g. a video decoder or ad blocker
+    the plug-in might be malicious or buggy
+  browser needs a "sandbox"
+    execute the plug-in, but limit syscalls / memory accesses
+  assume browser runs as a Dune process:
+    [diagram: browser in guest supervisor mode, plug-in guest user mode]
+    browser creates page table with PTE_U mappings for memory plug-in can use
+      and non-PTE_U mappings for rest of browser's memory
+    set %cr3
+    sret into untrusted code, in guest user mode
+    plug-in can read/write allowed PTE_U memory via page table
+    plug-in can execute system call instruction
+      but its system calls trap into the browser (not the underlying kernel)
+      and the browser can decide whether to allow each one
+
+Example: garbage collection (GC)
+  (modified Boehm concurrent mark-and-sweep collector)
+  GC follows pointers to find all live (reachable) objects
+    starting at registers
+  But this GC is concurrent
+    so program may modify an object after GC has traced it
+  GC needs a way to know which objects were modified,
+    so it can re-visit modified objects
+  How does Dune help?
+    Use PTE dirty bit (PTE_D) to detect written pages
+    Dune allows direct access to PTEs
+      much faster than making Linux system calls to get at PTEs
+
+Fast user-level access to VM could help many programs
+  Appel and Li paper
+
+How might Dune hurt performance?
+  Table 2
+    sys call overhead higher due to VT-x entry/exit
+    faults to kernel slower, for same reason
+    TLB misses slower b/c of EPT
+  But they claim most apps aren't much affected
+    b/c they don't spend much time in short syscalls &c
+    Figure 3 shows Dune within 5% for most apps in SPEC2000 benchmark
+      slower ones suffer from EPT lookups
+
+Of course it's not enough to merely not slow down apps much.
+
+How much can clever use of Dune speed up real apps?
+  Table 6 -- GC
+  compare "Dune dirty" line to "Normal" line
+  overall benefit depends on how fast the program allocates
+  huge win on three allocation-intensive micro-benchmarks
+  not a win for applications that don't allocate much -- XML parser
+    EPT overhead does slow it down
+    but many real apps allocate more than this
+
+Next week:
+  yet another different approach to kernel architecture!

@@ -1,0 +1,242 @@
+6.1810 2024 Lecture 20: Networking
+
+topics
+  layering of packet formats
+  layering of kernel software stack
+  overload behavior -- today's paper
+
+why do we care how software handles network traffic?
+  s/w stacks -- and linux -- used pervasively for packet processing
+  low-end routers, firewalls, VPNs
+  services: DNS, web
+  performance, design, overload behavior are hot topics
+
+paper's scenario:
+  [3-iface router, two LANs, hosts, Internet]
+
+ethernet packet format
+  [kernel/net.h, struct eth]
+  (preamble bits for synchronization, e.g. 10101010)
+  (start symbol, e.g. 10101011)
+  destination ethernet address -- 48 bits
+  source ethernet address -- 48 bits
+  ether type -- 16 bits
+  payload
+  (CRC-32)
+  (end symbol; e.g. 8b/10b or manchester)
+
+[tcpdump -t -xx -n | more]
+
+ethernet addresses
+  every Ethernet NIC has a unique ethernet address, built in
+    assigned by NIC manufacturer
+    <24-bit manufacturer ID, 24-bit serial number>
+  original Ethernet was broadcast on a cable
+    a host uses dest addr to decide if the packet is really for it
+  today's ethernet LAN is a switch, with a cable to each host
+    the switch uses the dest addr to decide which host to send a packet to
+
+could we use ethernet addresses for everything?
+  1. no: ethernet was not the only kind of bottom-layer address
+  2. no: "flat" addresses make wide-area routing hard
+  so: 32-bit IP addresses, with routing hints in the high bits
+
+IP header
+  [kernel/net.h, struct ip]
+  ether type 0x0800
+  lots of stuff, but addresses are the most critical
+  a 32-bit IP address is enough to route to any Internet computer
+  the high bits contain a "network number" that helps routers
+    understand how to forward through the Internet
+  the protocol number tells the destination what to do with the packet
+    i.e. which higher-layer protocol to hand it to (usually UDP or TCP)
+
+[tcpdump -t -n -xx ip | more]
+
+note:
+  pattern: "nest" higher-layer packets inside lower-layer packets
+  [diagram: eth | ip | udp | DNS]
+  one layer's payload starts with the next layer's header
+  so you often see a sequence of headers
+
+UDP header
+  [kernel/net.h, struct udp]
+  once a packet is at the right host, what app should it go to?
+  UDP header sits inside IP packet
+  contains src and dst port numbers
+  an application uses the "socket API" system calls to tell
+    the kernel it would like to receive all packets sent to a particular port
+  some ports are "well known", e.g. port 53 is reserved for DNS server
+  others are allocated as-needed for the client ends of connections
+  after the UDP header: payload, e.g. DNS request or response
+
+[tcpdump -t -n udp]
+
+**********
+
+what does the network code look like in a typical kernel?
+  design matters for performance, overload
+
+control flow
+  * NIC hardware (often more than one NIC!)
+    NIC internal buffers
+  * NIC DMA engine
+    DMA RX ring
+  * rx interrupt handler, copies from NIC to s/w input queue
+    IP input queue
+  * network thread
+    IP &c processing
+    maybe forward
+    maybe socket queue
+  * applications
+  * output processing
+  - IP output queue
+  * tx interrupt handler
+  - frees finished NIC TX DMA ring slots
+  - copies from s/w output queue to TX ring
+  * NIC
+
+the net lab is a subset of this arrangement
+
+notes:
+  -- each layer parses, validates, and strips headers on the way in
+     discards packet if damaged or queue too long
+  -- each layer prepends a header on the way out
+  
+why all these packet queues?
+  absorb temporary input bursts, to avoid forcing discard if s/w is busy
+  keep output NIC busy while computing
+  allow independent control flow (NICs vs network thread vs apps)
+    queues at boundaries
+
+other arrangements are possible and sometimes much better
+  e.g. user-level stack
+  e.g. direct user access to NIC (see Intel's DPDK)
+  e.g. polling, as in today's paper
+
+**********
+
+Today's paper: Eliminating Receive Livelock in an Interrupt-Driven Kernel,
+by Mogul and Ramakrishnan, 1996
+
+Why are we reading this paper?
+  To examine some tradeoffs in kernel network stack structure
+  It's a famous and influential paper
+  Analogues to livelock arise in many systems
+
+Context
+  software routers very common, often Linux
+    e.g. firewalls, cable modems, wifi access points
+  max network speed often > router speed
+  thus overload a possibility
+
+Explain Figure 6-1
+  This is the original system, without the authors' fixes.
+    The system is a router: [NIC, RX intr, input q, IP, output q, TX intr,  NIC]
+    (Figure 6-2)
+  Why do the black dots go up?
+  What determines how high the peak is?
+    peak @ 5000 => 200 us/pkt.
+  Why do the black dots go down?
+  What determines how fast it goes down?
+  What happens to the packets that aren't forwarded?
+
+The problem:
+  NIC interrupts have priority over all other processing.
+  As input rate grows, interrupts eventually use 100% of CPU.
+  No CPU time then available for the rest of IP processing.
+    (only one core!)
+  IP input queue grows to maximum allowed length.
+  NIC interrupts then read each packet, see max queue, discard packet.
+
+A higher-level view:
+  Software wastes time partially processing packets that it
+    will eventually discard.
+
+Could livelock happen in the net lab?
+
+Suppose the router design was as good as is possible.
+  What would the graph then look like?
+  That is, what is it reasonable to aim for?
+
+What's the paper's solution?
+  No IP input queue
+  NIC receive interrupt just wakes up net thread
+    Then leaves interrupts *disabled* for that NIC
+  Thread does all processing,
+    re-checks NIC for more input,
+    only re-enables interrupts if no input waiting.
+
+polling net thread:
+while(1)
+  if NIC packets waiting
+    read a packet from NIC
+    completely process the packet
+  else
+    enable interrupts
+    sleep
+
+What happens when packets arrive quickly?
+
+Why interrupt at all? Why not always poll?
+  What happens when packets arrive slowly?
+
+Modern Linux uses a scheme -- NAPI -- inspired by this paper.
+
+Explain Figure 6-3
+  This graph includes their system.
+  Why do the empty squares level off?
+  Why don't the empty squares go down like Figure 6-1?
+  What happens to the excess packets?
+
+A higher-level view:
+  Discard happens as early as possible (in the NIC).
+  CPU does not waste time partially processing doomed packets.
+
+Why does "Polling (no quota)" work badly?
+  Input starves xmit-complete processing
+
+Why does "no quota" rapidly fall, rather than gradually decreasing?
+  Livelock is made worse by doing even more processing before discard
+  I.e. each excess rx pkt consumes many tx pkts of CPU time
+
+Explain Figure 6-4
+  (this is with every packet going through a user-level program)
+  Why does "Polling, no feedback" behave badly?
+    There's a queue in front of screend
+    If overload, 100% to net thread, 0% to screend
+  Why does "Polling w/ feedback" behave well?
+    Net thread sleeps when queue to screend near-full
+    Wakes up when queue near-empty
+
+Big picture: polling loop is a place to exert scheduling control
+  quotas, feedback
+
+General principles?
+  Don't start new work if that might prevent completion of existing work
+  When discard needed, do it as early as possible
+  Design so that efficiency increases with load,
+    rather than decreasing. E.g. the paper's switch from
+    interrupts to polling under high load.
+
+Other approaches to the same problem
+  interrupt coalescing
+  multi-core and multiple NIC queues
+  expose NIC DMA rings to user code (DPDK)
+
+Similar phenomena arise in other areas of systems
+  Timeout + resend in networks, as number of connections grows
+  Spin-locks, as number of cores grows
+
+A general lesson: complex (multi-stage) systems need careful
+  scheduling of resources if they are to survive overload
+
+Linux's NAPI polling/interrupting scheme:
+  https://www.usenix.org/legacy/publications/library/proceedings/als01/full_papers/jamal/jamal.pdf
+  https://lwn.net/Articles/833840/
+screend:
+  https://citeseerx.ist.psu.edu/document?repid=rep1&type=pdf&doi=a822dc4058040a5a3866af897d9af9f618ba83ed
+  http://bitsavers.informatik.uni-stuttgart.de/pdf/dec/tech_reports/NSL-TN-2.pdf
+AMD LANCE NIC interface:
+  https://www.ardent-tool.com/datasheets/AMD_Am7990.pdf
+  https://en.wikipedia.org/wiki/AMD_LANCE_Am7990

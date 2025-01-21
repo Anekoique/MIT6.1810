@@ -1,0 +1,309 @@
+6.1810 2024 Lecture 3: OS design
+
+Lecture Topic:
+  OS design -- high level
+  Starting up xv6
+  Many details deferred to later lectures
+
+OS picture
+  apps: sh, echo, ...
+  system call interface (open, read, fork, ...)
+  kernel
+  CPU, RAM, disk
+  "OS" versus "kernel"
+
+Isolation a big reason for separate protected kernel
+
+Strawman design: No OS
+  [sh, echo | CPU, RAM, disk]
+  Applications directly interact with hardware
+  efficient! flexible! and sometimes a good idea.
+
+Main problem with No OS: lack of isolation
+  Resource isolation:
+    One app uses too much memory, or hogs the CPU, or uses all the disk space
+  Memory isolation:
+    One app's bug writes into another's memory
+
+Unix system call interface limits apps in a way that helps isolation
+  often by abstracting hardware resources
+  fork() and processes abstract cores
+    OS transparently switches cores among processes
+    Enforces that processes give them up
+    Can have more processes than cores
+  exec()/sbrk() and virtual addresses abstract RAM
+    Each process has its "own" memory -- an address space
+    OS decides where to place app in memory
+    OS confines a process to using its own memory
+  files abstract disk-level blocks
+    OS ensures that different uses don't conflict
+    OS enforces permissions
+  pipes abstract memory sharing
+
+System call interface carefully thought out to provide isolation
+  But still allow controlled sharing, and portability
+
+Isolation is about security as well as bugs
+ 
+What do OS designers assume about security?
+  We assume user code is actively malicious
+    Actively trying to break out of isolation
+    Actively trying to trick system calls into doing something stupid
+    Actively trying to interfere with other programs
+  We assume kernel code is trustworthy
+    We assume kernel developers are well-meaning and competent
+    We're not too worried about kernel code abusing other kernel code.
+    Of course, there are nevertheless bugs in kernels
+  So kernel must treat all user interaction carefully
+  => Requires a security mindset
+    Any bug in kernel may be a security exploit
+
+How can a kernel defend itself against user code?
+  two big components:
+    hardware-level controls on user instructions
+    careful system call interface and implementation
+
+hardware-level isolation
+  CPUs and kernels are co-designed
+  - user/supervisor mode
+  - virtual memory
+  
+user/supervisor mode (also called kernel mode)
+  supervisor mode: can execute "privileged" instructions
+    e.g., device h/w access
+    e.g., modify page tables
+  user mode: cannot execute privileged instructions
+  Kernel in supervisor mode, applications in user mode
+  [RISC-V has also an M mode, which we mostly ignore]
+
+Processors provide virtual memory
+  page table maps VA -> PA
+  Limits what memory a user process can use
+  OS sets up page tables so that each application can access only its memory
+    And cannot get at kernel's memory
+  Page table only be changed in supervisor mode
+  We'll spend a lot of time looking at virtual memory...
+
+The RISC-V Instruction Set Manual Volume II: Privileged Architecture
+  supervisor-only instructions, registers -- p. 11
+  page tables
+
+How do system calls work?
+  Applications run in user mode
+  System calls must execute in kernel in supervisor mode
+  Must somehow allow applications to get at privileged resources!
+
+Solution: instruction to change mode in controlled way
+  open():
+    ecall <n>
+  ecall does a few things
+    change to supervisor mode
+    start executing at a known point in kernel code
+  kernel is expecting to receive control at that point in its code
+  a bit involved, will discuss in a later lecture
+
+Aside: can one have process isolation WITHOUT h/w-supported
+  supervisor/user mode and virtual memory?
+  yes! use a strongly-typed programming language
+    For example, see Singularity O/S
+    but users can then use only approved languages/compilers
+  still, h/w user/supervisor mode is the most popular plan
+
+Monolothic kernel
+  [diagram]
+  kernel is a single big program implementing all system calls
+  Xv6 does this.  Linux etc. too.
+  kernel interface == system call interface
+  - good: easy for subsystems to cooperate
+    one cache shared by file system and virtual memory
+  - bad: interactions are complex
+    leads to bugs
+    no isolation within kernel for e.g. device drivers
+
+Microkernel design
+  [diagram]
+  minimal kernel
+    IPC, memory, processes
+    but *not* other system calls
+  OS services run as ordinary user programs
+    FS, net, device drivers
+  so shell opens a file by sending msg thru kernel to FS service
+  kernel interface != system call interface		
+  - good: encourages modularity; limit damage from kernel bugs
+  - bad: may be hard to get good performance
+
+How common are kernel bugs?
+  Common Vulnerabilities and Exposures web site
+  https://cve.mitre.org/cgi-bin/cvekey.cgi?keyword=linux
+
+Both monolithic and microkernel designs widely used
+
+O/S kernels are an active area of development
+  phone, cloud, embedded, iot, &c
+  lwn.net
+
+Let's look at xv6 in particular
+
+xv6 runs only on RISC-V CPUs
+  and requires a specific setup of surrounding devices -- the board
+  modeled on the "SiFive HiFive Unleashed" board
+  hifive.pdf
+  A simple board (e.g., no display)
+    - RISC-V processor with 4 cores
+    - RAM (128 MB)
+    - UART for console
+    - disk-like storage
+    - ethernet
+    - boards like this are pretty cheap, though not powerful
+  Qemu emulates this CPU and a similar set of board devices
+    - called "virt", as in "qemu -machine virt"
+      https://github.com/riscv/riscv-qemu/wiki
+    - close to the SiFive board (https://www.sifive.com/boards)
+      but with virtio for disk
+
+What's inside the RISC-V chip on this board?
+  four cores, each with
+    32 registers
+    ALU (add, mul, &c)
+    MMU
+    control registers
+    timer, interrupt logic
+    bus interface
+  the cores are largely independent, e.g. each has its own registers
+    they share RAM
+    they share the board devices
+
+xv6 kernel source
+  % make clean
+  % ls kernel
+  e.g. file system in kernel/fs.c
+  % vi kernel/defs.h -- shows modules, internal interfaces
+  small enough for us to understand all by end of semester
+  much smaller than linux, but captures some key ideas
+
+building xv6
+  % make 
+  gcc on each kernel/*.c, .o files, linker, kernel/kernel
+  % ls -l kernel/kernel
+  % more kernel/kernel.asm
+  and produces a disk image containing file system
+  % ls -l fs.img
+
+qemu
+  % make qemu
+  qemu, loads kernel binary into "memory", simulates a disk with fs.img
+  jumps to kernel's first instruction
+  qemu maintains mock hardware registers and RAM, interprets instructions
+
+I'll walk through xv6 booting up, to first process making first system call
+
+% make CPUS=1 qemu-gdb
+% riscv64-linux-gnu-gdb
+(gdb) b *0x80000000
+(gdb) c
+kernel is loaded at 0x80000000 b/c that's where RAM starts
+  lower addresses are device hardware
+% vi kernel/entry.S
+"m mode"
+set up stack for C function calls
+jump to start, which is C code
+
+% vi start.c
+  sets up hardware for interrupts &c
+  changes to supervisor mode
+  jumps to main
+
+(gdb) b main
+(gdb) c
+(gdb) tui enable
+
+main()
+  core 0 sets up a lot of software / hardware
+  other cores wait
+  "next" through first kernel printfs
+
+let's glance at an example of initialization -- kernel memory allocator
+(gdb) step -- into kinit()
+(gdb) step -- into freerange()
+(gdb) step -- into free()
+% vi kernel/kalloc.c
+kinit/freerange find all pages of physical RAM
+  make a list from them
+  threaded through the first 64 bytes of each page
+  a simple allocator, only 4096-byte units, for e.g. user memory
+
+how to get processes going?
+  our goal is to get the first C user-level program running
+    called init (see user/init.c)
+    init starts up everything else (just console sh on xv6)
+  need:
+    struct proc
+    user memory
+    instruction bytes in user memory
+    user registers, at least sp and epc
+  main() does this by calling userinit()
+
+(gdb) b userinit
+(gdb) continue
+
+% vi kernel/proc.c
+allocproc()
+  struct proc
+  p->pagetable
+
+back to userinit()
+
+% vi user/initcode.S
+exec("/init", ...)
+ecall
+a7, SYS_exec
+% vi kernel/syscall.h
+note SYS_exec is number 7
+
+back to userinit()
+
+epc -- where process will start in *user* space
+and sp
+p->state = RUNNABLE
+
+(gdb) b *0x0
+(gdb) c
+(gdb) tui disable
+(gdb) x/10i 0
+
+what's the effect of ecall?
+(gdb) b syscall
+(gdb) c
+back in the kernel
+(gdb) tui enable
+(gdb) n
+(gdb) n
+(gdb) n
+(gdb) print num
+      from saved user register a7
+(gdb) print syscalls[7]
+(gdb) b exec
+(gdb) c
+
+% vi kernel/exec.c
+  a complex system call
+  read file from disk
+  "ELF" format
+  text, data
+  defensive, lots of checks
+  don't be tricked into overwriting kernel memory!
+  allocate stack
+  write arguments onto stack
+  epc = 
+  sp = 
+
+(gdb) c
+
+% vi user/init.c
+  top-level process
+  console file descriptors, 0 and 1
+  sh
+
+Next lecture:
+  virtual memory and page tables
+

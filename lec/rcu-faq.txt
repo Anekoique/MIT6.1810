@@ -1,0 +1,239 @@
+FAQ for "RCU Usage In the Linux Kernel: One Decade Later", by
+McKenney, Boyd-Wickizer, and Walpole, 2012.
+
+Q: How can RCU be effective even though rcu_read_lock() doesn't seem
+to do anything to lock out writers?
+
+A: Mostly RCU is a set of rules that readers and writers must follow
+that ensure that the data structure can always be safely read, even
+while it's in the middle of being changed.
+
+A simple version of the RCU story: the overall goal is to allow
+lock-free read access to shared objects. Code that wants to modify
+such an object must instead create a complete new version of the
+object in newly allocated memory, and then update pointers to the
+object to point to the new version. Thus a reader sees either the old
+object, or the new object, but never an object that's actively being
+written. The writing code needs to free the old object -- but what if
+a reader on a different core is still using the old object? The writer
+must wait for any such reader to finish before freeing the old object.
+synchronize_rcu() performs this wait in a particularly efficient way.
+
+Q: How does RCU prevent two writers from interfering with each other?
+
+A: It doesn't. Writers need to make their own arrangements to avoid
+interfering, typically spin-locks.
+
+Q: How is it possible that RCU increases performance when
+synchronize_rcu() can take as long as a few milliseconds?
+
+A: RCU can only improve parallel performance for data that is mostly
+read, and rarely written. That is, it should be used when the benefit
+of allowing many readers to avoid the cost of locking outweighs the
+cost of occasional writers spending a long time in synchronize_rcu().
+
+Q: Why does synchronize_rcu() wait for all cores to context-switch?
+Wouldn't it be faster to only wait for the cores that are in RCU
+critical sections? And couldn't synchronize_rcu() only wait long
+enough for them to finish their critical sections, rather than waiting
+the much longer time until they context switch? Better yet, couldn't
+an RCU writer wait only for read critical sections that are reading
+the data the writer wrote?
+
+A: It's true that synchronize_rcu() is not precise: it usually waits
+longer than it has to.
+
+In order for synchronize_rcu() to be more precise, it would have to
+know in more detail what was happening on all other cores, e.g. for
+each core, whether it is in an RCU read critical section, and if so,
+when that core exits the critical section. Perhaps
+rcu_read_lock()/_unlock() on each core could maintain some state in
+memory reflecting the core's current status with respect to RCU
+critical sections. However, reading data that was most recently
+written by another core takes a long time; it is that problem with
+spin-locks that RCU was invented to avoid. So it seems likely that
+making synchronize_rcu() much more precise would reduce the
+performance win of RCU.
+
+The way synchronize_rcu() works has a nicely efficient batching
+property: cores need to communicate fairly rarely (on each context
+switch), and that one item of communication can trigger a large number
+of threads waiting in synchronize_rcu().
+
+Q: synchronize_rcu() only waits for RCU read critical sections that
+start before the call to synchronize_rcu(). What about read critical
+sections that start while synchronize_rcu() is executing?
+
+A: It's true that synchronize_rcu() is only guaranteed to wait for RCU
+read critical sections that started before the writer called
+synchronize_rcu(). A critical section that starts after the writer got
+to the point of calling synchronize_rcu() must also have started after
+the writer finished writing to the new version of the object, and
+after the writer updated the pointer to point to the new object, and
+thus that critical section will see the new object, not the old
+object. So it won't be disturbed when the writer frees the old object
+after synchronize_rcu() returns.
+
+Q: What's the difference between synchronize_rcu() and call_rcu()?
+
+A: synchronize_rcu() doesn't return until all cores have gone through
+at least one context switch. call_rcu(f,x) returns immediately, after
+adding <f,x> to a list of callbacks. The callback -- f(x) -- is called
+after all cores have gone through at least one context switch.
+
+call_rcu() is nice because it doesn't delay the writer. It can be
+dangerous if called a lot, though, because the list it appends to
+might grow very long. And the amount of unfreed memory referred to the
+by call_rcu() list might be large (i.e. it might cause the kernel to
+run out of memory).
+
+Q: What do rcu_read_lock() and rcu_read_unlock() do?
+
+A: rcu_read_lock() prevents timer interrupts from forcing a
+pre-emptive context switch on the current CPU, and rcu_read_unlock()
+enables pre-emptive context switches. This enable/disable is very
+cheap (as in Figure 2). The point is to ensure that any concurrent
+synchronize_rcu() waits until after the rcu_read_unlock(). Despite
+"lock" in the name, no locking is involved.
+
+Q: How do rcu_assign_pointer() and rcu_dereference() work?
+
+A: They are C macros that insert memory barrier compiler directives.
+rcu_assign_pointer(a,p) expands into something like:
+
+  __sync_synchronize();
+  *a = p;
+
+and rcu_dereference(expr) into something like:
+
+  tmp_ptr = expr; // evaluate expr only once
+  __sync_synchronize();
+  ... tmp_ptr ...
+
+The expr argument might be a complex expression whose value could
+change; rcu_dereference(expr) ensures that it is evaluated exactly
+once and that the resulting pointer is cached in a local variable
+where it won't change.
+
+__sync_synchronize() itself tells the compiler not to move any memory
+references past it, and also causes the compiler to emit whatever
+machine instructions are needed to prevent the machine from moving
+loads/stores (a fence instruction on the RISC-V).
+
+Q: Is RCU likely to be more bug-prone than locking?
+
+A: That may well be the case. It is a price the Linux developers are
+often willing to pay to get higher multi-core performance for
+read-heavy data. Here's a list of common problems that arise due to
+RCU: https://www.kernel.org/doc/Documentation/RCU/checklist.txt
+
+Q: What does the paper mean in Section 4.2 when it suggests that RCU
+can be used for reference counting?
+
+A: What the paper means by reference counting is delaying the free of
+an object until after any reading threads are guaranteed to have
+stopped using the object. So the paper is talking about using RCU
+instead of reference counts, not using RCU to implement counters.
+
+"Delayed freeing" or "garbage collection" might be a better term than
+"reference counting", since the paper's RCU doesn't actually count
+references.
+
+For objects that have long-term references to them, for example xv6's
+struct file, one still needs to maintain explicit reference counts.
+
+Q: What is an NMI?
+
+A: An NMI is an interrupt; it stands for non-maskable interrupt. NMIs
+can be caused by hardware errors, by timers used to drive CPU
+profiling or debugging, and by watchdog timers to catch a hung
+operating system. NMIs cannot be disabled.
+
+Of particular relevance is that the NMI interrupt handler might be
+called even when a spinlock is held, despite the fact that spinlocks
+disable ordinary interrupts. Thus it is dangerous for an NMI interrupt
+handler to try to acquire a spinlock, since the interrupted code might
+already hold that lock.
+
+Q: What does the mention of a single pointer mean in Section 5.1?
+
+A: Suppose there's an object that a writing thread wants to update,
+and the object has multiple fields (e.g. a C struct). One plan is for
+the writer to update the fields in place while holding a lock, and to
+require reading threads to acquire the lock also, so that they won't see
+the object in an inconsistent state midway through the writer
+modifying it.
+
+But RCU's big goal is to allow readers to read objects without holding
+locks. So a common RCU pattern is for the writer to first allocate new
+memory for a new version of the object, set all of its fields, and
+after it's done, set whatever public pointer points to the object so
+that it points to the newly allocated object. Readers have to use that
+pointer to get at the object, so either a reader will see a pointer to
+the old object (which the writer isn't modifying), or a reader will
+see a pointer to the new object (which the writer finished creating
+before setting the pointer). And the reader won't ever see a partially
+updated object.
+
+This pattern is most straightforward when each object in question has
+only a single pointer referring to it, so that a single store
+instruction is enough to switch from the old to the new version.
+
+Q: Could RCU readers see old data, even after it has been replaced by
+new data?
+
+A: If a writer has just replaced data with a new version, there's a
+window of time in which a reader may see the old data. And if a reader
+looks twice at the data, it may see that the data has changed. This
+makes RCU different from ordinary locking. Programmers who use RCU
+need to convince themselves that this lack of freshness and atomicity
+is OK.
+
+For the examples I have been able to think of, a little staleness is
+not a problem. One factor is that RCU readers don't write the
+RCU-protected data. So you cannot run into trouble with lost updates,
+e.g. a thread that increments a counter, but reads a stale old value,
+and thus writes an incorrect new value. That's a read/write access,
+not read, so you couldn't use RCU anyway.
+
+Another factor is that RCU hides partial updates, since the writer is
+expected to write a newly allocated new version of the object, and not
+update the old object in-place. So a reader will see
+internally-consistent objects, not partially-written objects.
+
+Another factor is that (assuming the writer calls synchronize_rcu()) a
+reader will only see old data if the reader is concurrent with the
+writer. Even if using locks in the usual way, if a reader looks at
+data (really, calls acquire()) at the same time that a writer updates
+the data (really, calls acquire()), there's no guarantee about whether
+the reader will see the data before or after it's written. From this
+point of view, the data a reader sees with RCU is no staler than the
+data the reader might see using locks.
+
+Q: Why doesn't xv6 use RCU?
+
+A: xv6 uses spinlocks because they are powerful and general and
+probably the most commonly used mutual exclusion scheme. In addition
+it's hard to sensibly apply optimizations like RCU to xv6, because
+it's difficult to judge their performance effect under qemu.
+
+Q: How does synchronize_rcu() work?
+
+A: Have a look at Sections 3.5.4 and 4 of this paper for an efficient
+implementation:
+
+    http://www2.rdrop.com/users/paulmck/RCU/rclockpdcsproof.pdf
+
+The basic idea is that each CPU keeps a count of how many context
+switches it has performed. synchronize_rcu() periodically checks these
+counters.
+
+Q: For what kinds of shared data would you NOT want to use RCU?
+
+A: If writes are common; if you need to hold pointers across context
+switches; if you need to update objects in place; if the data
+structure can't be updated with a single committing pointer write; if
+synchronize_rcu() (which can block) would need to be called at
+interrupt time. More generally, RCU needs to be used in a system in
+which context switches are frequent, and RCU can learn about them;
+this is easy in the kernel, but harder in user space.

@@ -1,0 +1,146 @@
+Frequently Asked Questions for Rarayanan et al.'s "RedLeaf: Isolation
+ and Communication in Safe Operating System"
+
+Q: How do the efforts to adapt Rust in Linux relate to this paper?
+
+A: There is much work in the Linux community to use Rust as a
+replacement for C, which is not easy by itself; see, for example,
+https://www.usenix.org/publications/loginonline/empirical-study-rust-linux-success-dissatisfaction-and-compromise. The
+paper explores a different problem: could we design an OS with
+language-isolation instead of hardware-isolation (i.e., page tables,
+user/kernel mode, etc.)?  Whether the paper ideas will make impact
+long term is unclear for now.
+
+Q: I'm having trouble understanding how these abstractions interact
+with existing memory managment hardware. Does it have one page table
+and how are pages managed?
+
+A: RedLeaf doesn't use page tables, user/kernel mode, etc.  It's
+isolation is based on language-level type-safety and memory
+management.
+
+Q: What are domains?
+
+A: The unit of isolation, in the way that processes are the unit of
+isolation in xv6.
+
+Q: Can transparent driver recovery work for any device?
+
+A: RedLeaf's driver recovery works well for state-less drivers like
+network drivers.  Transparent recovery of drivers that write to
+persistent storage are difficult to do transparently, unless the
+storage system using the driver follows a crash-safe discipline like
+logging.
+
+Q: What is zero-copy communication?
+
+A: A performance goal that boils down to avoiding copying arguments
+when one domain calls a method in another domain. If one domain passes
+a large buffer to another domain, copying that buffer is expensive. By
+storing the buffer in RedLeaf's shared heap this copy can be avoided
+because a domain can pass just the reference to the buffer to another
+domain, which leads to zero copies.
+
+Q: What is a "migrating thread"?
+
+A: In xv6 communication happens between threads: one thread sends a
+data over a pipe and another thread receives the data.  In RedLeaf the
+sending thread enters (migrates to) the receiving domain and runs the
+invoked method.
+
+Q: What are some features or restrictions that Rust has that make it
+so much more memory-safe than C and other programming languages?
+
+A: It doesn't allow arbitrary casts between types as in C.  It
+enforces the ownership rule, which allows the Rust compiler to do
+perform static analysis of lifetimes of objects and deallocate them;
+in C, the developer is responsible for freeing memory. This avoids
+large classes of bugs that developers in C make. The ownership rule
+puts restrictions on how to write programs, and switching from C to
+Rust isn't straightforward.
+
+Q: What a linear type is in Rust?
+
+A: This reference is a good starting point:
+https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html
+
+Q: How does Rust manage resources/memory without a garbage collector?
+
+A: Through the ownership rule, which allows the Rust compiler to do
+perform static analysis of lifetimes of objects and deallocate them.
+
+Q: What other languages have been considered for develop an OS. Has
+there been an OS written in Python, and how did it perform?
+
+A: Interpreted languages like Python are in general not suitable for
+kernels, because interpretation has a significant runtime overhead.
+An alternative to Rust is Java, which was popular for a for systems
+programming but it uses a garbage collector for memory management,
+which is hard to work well with kernels (because kernels cannot really
+tolerate GC pauses).  This paper provides a detailed analysis of GC
+overheads for writing a kernel in GC-based language (Go):
+https://www.usenix.org/conference/osdi18/presentation/cutler
+
+Q: How does RedLeaf ensure that cross-domain calls contains follow the
+exchange rules?
+
+A: RedLeaf defines an interface definition language to invoke methods
+in other domains.  The languages is designed such that the IDL
+compiler can check that the types of arguments passed to a domain are
+exchangeable. The last paragraph 3.1.5 sketches what the static
+checking entails.
+
+Q: Why create Rv6 instead of running an existing OS like Linux on top
+of RedLeaf?
+
+A: The authors want to explore the cost and benefits of fine-grained
+isolation domains.  As a test case, they split rv6 into several
+subdomains instead of running an existing OS as a single domain on top
+of RedLeaf.
+
+Q: Is it safe for RedLeaf to trust "Rust core libraries that use
+unsafe code"?
+
+A: Rust core libraries use Rust unsafe to step out of the restrictions of
+the type system.  This in principle breaks RedLeaf gurantees, but the
+authors are assuming the Rust developers of the core libraries know
+what they are doing and didn't introduce bugs.
+
+Q: What are some characteristics of safe/high-level languages?
+
+A: The key properties are type-safe/memory-safe and automatic
+memory management.
+
+Q: How does RedLeaf handle communication between domains when complex
+data structures are passed?
+
+A: RedLeaf passes such data structures by reference by passing an
+RRef<T>, which can have pointers to other objects on the shared heap,
+so RedLeaf can transfer complicated tree-like data structures across
+domains by just passing the root of the tree.
+
+Q: What does "thread unwinding" do?
+
+A: When a thread panics, its state (i.e., pc, sp, and other registers)
+at the time of the panic may not allow the thread to continue to run
+and return an error. The unwinding restores the state to what it was
+when the thread invoked the method that paniced, ensuring that the
+thread can continue and return an error.
+
+Q: Is RedLeaf able to prevent Spectre/Meltdown attacks?
+
+A: No. The authors are "speculating" that future CPU fixes (and Rust
+improvements) will make this a non-issue for RedLeaf.
+
+Q: What is a proxy and what is its role?
+
+A: A proxy is a piece of Rust code generated by the RedLeaf IDL
+compiler. A proxy helps isolating the calling domains from panics in
+the callee domain and allows passing large arguments by reference
+through the shared heap (see figure 2).  To call a method in another
+domain the domains calls the proxy method, which does some bookkeeping
+(e.g., changes ownership of arguments passed by reference, checks that
+the destination domain hasn't crashes, makes a continuation instead
+thread panics in the destination domain etc), and then invokes the
+method in the destination domain.
+

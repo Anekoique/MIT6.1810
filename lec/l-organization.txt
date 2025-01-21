@@ -1,0 +1,313 @@
+6.1810 2024 L17: Operating System Organization, Microkernels
+
+Topic:
+  What should a kernel do?
+  What should its abstractions / system calls look like?
+
+Or:
+  xv6 / Unix / Linux are similar in overall architecture
+  Are there alternatives?
+  Can we learn from them?
+  This topic is more about ideas and less about specific mechanisms
+
+The "traditional approach" -- UNIX, Linux, xv6
+  1) powerful abstractions, and
+  2) a "monolithic" kernel implementation
+
+Traditional philosphy: powerful abstractions
+  for programmers: convenience, portability
+    files, not disk controller registers
+  for kernel: help sharing and managing resources
+    file/directory abstraction lets kernel be in charge of disk layout
+  for kernel: help with security
+    file permissions
+
+Powerful abstractions have led to big "monolithic" kernels
+  kernel is one big program, like xv6
+  easy for kernel sub-systems to cooperate -- no irritating boundaries
+    exec() and mmap() enjoy close integration with both FS and VM system
+  all kernel code runs with high privilege -- no internal security restrictions
+
+What's wrong with monolithic kernels / big abstractions?
+  big => complex => perhaps buggy/insecure
+  over-general => perhaps slow
+    how much code executes to send one byte via a UNIX pipe?
+      buffering, locks, sleep/wakeup, scheduler
+  big abstractions hide/enforce lots of design decisions, perhaps awkwardly
+    maybe I want to wait for a process that's not my child
+    maybe I want to change another process's address space
+    maybe DB is better at laying out B-Tree files on disk than kernel FS
+
+Microkernels -- a different approach
+  main goal: simplest possible kernel
+  main technique: move most O/S functionality to user-space service processes
+  [diagram: h/w, kernel, services (FS disk VM TCP NIC display), apps]
+  what does the kernel provide?
+    address spaces, memory management, threads, IPC
+    IPC = Inter-Process Communication
+  1980s saw big burst of research on microkernel designs
+    CMU's Mach perhaps the most influential
+  outcome:
+    lots of academic research
+    many ideas adopted by traditional kernels
+    microkernels used in some embedded systems, rarely visible
+
+Why the interest in microkernels?
+  elegant
+  re-think from clean slate
+  small -> more secure -- less privileged code -> fewer exploitable bugs
+  small -> verifiable (see seL4)
+  small -> easier to optimize
+  small -> fewer design decisions forced on applications
+  user-level -> may encourage modularity of O/S services
+  user-level -> easier to extend / customize / replace user-level services
+  user-level -> more robust -- restart individual user-level services
+    most bugs are in drivers, get them out of the kernel!
+
+Microkernel challenges
+  What's the *minimum* possible kernel functionality?
+  Want simple primitives -- but powerful enough to build exec, fork, mmap, &c
+  Must still provide the rest of the O/S, at user level
+  How to get good performance, despite IPC and less integration?
+  How to encourage adoption?
+  Compatibility with existing applications?
+
+L4
+  has evolved over time, many versions and re-implementations
+  used commercially today, in phones and embedded controllers
+  representative of the micro-kernel approach
+  emphasis on minimality:
+    a few dozen system calls (Linux has 300+)
+    13,000 lines of code
+
+L4 basic abstractions
+  [diagram]
+  address space ("task")
+  page mappings
+  thread
+  IPC
+
+L4 services -- some system calls, some special IPCs:
+  create a task / address space 
+  create/destroy a thread
+  send/recv message via IPC (addresses are thread IDs)
+  intercept another address space's page faults -- "pager"
+    and change target's mappings
+  access device hardware
+  receive device interrupts via IPC
+
+L4 kernel is missing almost everything that Linux or even xv6 has
+  file system, fork(), exec(), pipes, device drivers, network stack, &c
+  If you want these, they have to be user-level code
+    library or server process
+
+how do L4 external pagers work?
+  every task has a pager task/thread
+  1. page fault
+  2. kernel suspends thread
+  3. kernel sends fault info in IPC to pager
+  4. pager picks one its own pages
+  5. pager sends virtual page address in IPC reply to faulting thread
+  6. kernel intercepts IPC, maps in target, resumes target
+
+what can you use an L4 pager for?
+  allocating memory -- "sigma0" allocates on fault for early tasks
+  on-demand creation of a child task's address space
+  mmap of file
+
+problem: IPC performance
+  Microkernel programs do lots of IPC!
+  Was expensive in early systems
+    multiple kernel crossings, TLB misses, context switches, &c
+  Cost of IPC caused many to dismiss microkernels
+  L4 designers put huge effort into IPC performance
+
+Here's a slow IPC design
+  patterned on UNIX pipes
+  [diagram, message queue in kernel]
+  send(id, msg)
+    append msg to queue in kernel, wakeup recv, return
+  recv(&id, &data)
+    if msg waiting in queue, remove, return
+    otherwise sleep()
+  called "asynchronous" and "buffered"
+  now the usual request-response pattern (RPC) involves:
+    [diagram: 2nd message queue for replies]
+    4 system calls (user->kernel->user)
+      send()
+               recv()
+               send()
+      recv()
+    or eight user/kernel or kernel/user crossings
+      each disturbs CPU's caches (TLB, data, instruction)
+    four message copies (two for request, two for reply)
+    two context switches, two general-purpose schedulings
+
+L4's fast IPC
+  "Improving IPC by Kernel Design," Jochen Liedtke, 1993
+  * synchronous
+    [diagram]
+    send() waits for target thread's recv()
+    common case: target is already waiting in recv()
+    send() returns into target, as if returning from recv()
+      no real context switch, no scheduler loop
+  * unbuffered
+    synchronous => both src and dst user buffer address known => direct copy
+    no need to copy to/from kernel buffer
+  * small messages in registers
+    send() returns as if target's recv() -- preserving sender's registers
+  * huge messages as page mappings
+    send() maps sender's pages into target's address space
+    recv() specifies address in target
+    again, no copy
+  * combined call() and sendrecv() system calls
+    IPC almost always used as request-response RPC
+    thus wasteful to use separate send() and recv() system calls
+    [diagram]
+    client: call(): send a message, obtain response
+    server: sendrecv(): reply to one request, wait for the next one
+    2x reduction in user/kernel crossings
+  * careful layout of kernel code to minimize cache footprint
+  result: 20x reduction in IPC cost
+
+How to build a full operating system on a microkernel?
+  Remember the idea was to move most features into user-level servers.
+    File system, device drivers, network stack, process control, &c
+  For embedded systems this can be fairly simple.
+  What about services for general-purpose use, e.g. workstations, web servers?
+  Really need compatibility for existing applications.
+    E.g. the system needs mimic something like UNIX.
+  Re-implement UNIX kernel services as lots of user-level service tasks?
+
+Idea: run existing Linux kernel as a process on top of the microkernel.
+  An "O/S server".
+  Perhaps not elegant, but pragmatic.
+  Part of a path to adoption:
+    Users might start by just running Linux apps.
+    Then gradually exploit possibilites of underlying microkernel.
+
+Which brings us to today's paper:
+  "The Performance of micro-Kernel-Based Systems",
+  by Hartig et al, 1997
+
+basic picture
+  [diagram]
+  L4 kernel
+  Linux kernel server
+  one L4 task per Linux process
+  IPC for Linux system calls
+
+What does it mean to run a Linux kernel at user-level?
+  The Linux kernel is just a program!
+  The authors modified Linux in small ways
+    replacing hardware access with L4 system calls or IPC.
+  Process creation, configuring user page tables, user memory allocation,
+    system call handling, interrupt handling.
+
+L4/Linux system calls via IPC
+  Each Linux process is an L4 task
+  Linux server is mostly a single L4 thread, waiting for IPC
+  System call:
+    IPC to Linux server (process blocks, waiting for IPC reply)
+    Linux server switches to that process's Linux kernel thread
+    Execute system call implementation
+    Send IPC reply (L4 delivers, process can resume)
+    Linux server waits for next system call IPC
+  Linux server has one internal thread per process
+    Like xv6, many system calls may be blocked e.g. in wait()
+  But an L4/Linux kernel thread switch has
+    no relation to user process switching
+  Instead, L4 does the switching
+    among both Linux kernel thread and the Linux process tasks
+
+L4/Linux server allocates all memory, hands out to processes
+  so all user memory also mapped into Linux server's address space
+  uses this for copyin()/copyout(), to dereference user pointers from sys calls
+  this keeps system call IPCs small -- data address, not the data itself
+  Linux server also uses its memory access for fork() and exec()
+
+Example: how does L4/Linux fork() work?
+  process P1 calls fork() (P1 is really an L4 task)
+  P1's libc library turns fork() into an IPC to L4/Linux server
+  L4/Linux allocates some of its pages for P2,
+           copies P1's mem via phys mappings
+  L4/Linux asks L4 to create a new task -- P2
+  L4/Linux sends special IPC to P2 with SP and PC to cause it to run
+  L4/Linux gets external pager faults from P2, maps pages one by one
+
+L4/Linux server acts as the pager for user processes
+  so L4 turns process page faults into IPC to Linux server
+  for e.g. copy-on-write fork, lazy allocation, memory mapped files
+
+L4/Linux server uses Linux device drivers unchanged!
+  since L4 allows it direct access to device registers
+  except interrupts arrive via L4 IPC
+
+How to evaluate?
+  What are some questions that the paper might answer?
+  It's not really about whether microkernels are a good idea.
+  Its main goal is to show they can have good performance.
+
+What kind of performance do we care about?
+  Is IPC fast?
+    -> microbenchmark
+  Is there some other performance obstacle?
+    -> whole-system benchmarks
+
+IPC microbenchmarks
+  Table 2
+  getpid() is one system call on native Linux
+    but two L4 system calls (call, sendrecv)
+    for two IPC messages (request, reply)
+  nice result: takes only somewhat more than 2x as long on L4/Linux
+  FAR faster than Mach+LinuxServer
+    why? the paper doesn't say, sadly.
+
+What do we think the impact of syscalls taking 2x as long might be?
+  Disaster?
+  Hardly noticeable?
+
+Whole-system benchmark: AIM
+  AIM forks a bunch of processes
+  Each randomly uses the disk, allocates memory, uses pipe, computes, &c
+    To do a fixed amount of total work
+  Figure 8 x-axis shows [some function of] number of concurrent AIM processes
+    y-axis shows time for all processes to complete
+  Only the slope really matters
+    slope is time per unit of work, so lower is better
+    Native Linux is best, but L4Linux is only a little slower
+    Mach+Linux is noticeably less efficient
+  Conclusions:
+    2x IPC time doesn't seem to make much overall difference
+    L4+Linux is only somewhat slower than Linux
+    L4+Linux is significantly faster than Mach+Linux
+
+These results are not by themselves an argument for using L4
+  But they are an argument against rejecting L4 due to performance worries
+
+What's the current situation?
+  Microkernels are sometimes used for embedded computing
+    Microcontrollers, Apple "enclave" processor
+    Running custom software
+  Microkernels never caught on for general computing
+    No compelling story for why one should switch from Linux &c
+  Many ideas from microkernel research have been adopted into modern UNIXes
+    Mach spurred adoption of sophisticated virtual memory support
+    Loadable kernel modules are a response to need for extensibility
+    IPC and user-level services are common
+
+Next lecture:
+  Another architectural direction: virtual machines
+
+References:
+L4 details
+  http://www.cse.unsw.edu.au/~cs9242/02/lectures/01-l4.pdf
+  http://www.cse.unsw.edu.au/~cs9242/02/lectures/01-l4/01-l4.html
+fast IPC in L4
+  https://cs.nyu.edu/~mwalfish/classes/15fa/ref/liedtke93improving.pdf
+later evolution of L4
+  https://trustworthy.systems/publications/nicta_full_text/8988.pdf
+an earlier paper on the ideas behind L4:
+  https://www.cs.fsu.edu/~awang/courses/cop5611_s2004/microkernel.pdf
+The Fiasco.OC Microkernel -- a current L4 descendent
+  https://l4re.org/doc/

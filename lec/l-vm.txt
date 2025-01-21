@@ -1,0 +1,270 @@
+6.1810 2024 Lecture 4: Virtual Memory/Page tables
+
+* plan:
+  address spaces
+  paging hardware
+  xv6 VM code
+
+## Virtual memory overview
+
+* today's problem:
+  [user/kernel diagram]
+  suppose the shell has a bug:
+    sometimes it writes to a random memory address
+  [physical memory, 0..2^64 : apps and kernel in same memory]
+  how can we keep it from wrecking the kernel?
+    and from wrecking other processes?
+
+* we want isolated address spaces
+  each process has its own memory
+  it can read and write its own memory
+  it cannot read or write anything else
+  challenge: 
+    how to multiplex several address spaces onto one physical memory?
+    while maintaining isolation
+
+* xv6 uses RISC-V's paging hardware to implement AS's
+  ask questions! this material is important but complex
+  topic of Thursday's lab (and shows up in several other labs)
+
+* page tables provide a level of indirection for addressing
+  CPU -> MMU -> RAM
+      VA     PA
+  s/w can only ld/st to virtual addresses, not physical
+  kernel tells MMU how to map each virtual address to a physical address
+    MMU essentially has a table, indexed by va, yielding pa
+    called a "page table"
+    va | pa
+    -------
+    x  |  y
+  code can only use addresses that have mappings in the table
+
+* we want a different address space for each process
+  so we need more than one page table -- and need to switch
+  MMU has a register (satp) that kernel writes to change page table
+
+* where does the page table live?
+  in memory
+  satp holds the (physical) address of the current page table
+  MMU loads page table entries from memory
+  kernel can modify page table by writing it in memory
+
+* how big is a page table?
+  there are 2^64 distinct virtual addresses possible
+  not practical to have a table with 2^64 entries!
+  many of details are about reducing size
+
+* RISC-V maps 4-KB "pages"
+  so page table only needs to have an entry per page
+  4 KB = 12 bits
+  RISC-V has 64-bit addresses
+  thus page table index is top 64-12 = 52 bits of VA
+    except that the top 25 of the top 52 are unused
+      no RISC-V has that much memory now
+      can grow in future
+    so, index is 27 bits.
+
+* Figure 3.1 -- simplified view
+  MMU uses index bits of VA to find a page table entry (PTE)
+  MMU constructs physical address using PPN from PTE + offset of VA
+  
+* what is in a PTE (page table entry)?
+  pte.pdf
+  [10 reserved | 44 PPN | 10 flags}
+  each PTE is 64 bits, but only 54 are used
+  44-bit PPN (physical page number) is top bits of 56-bit phys addr
+  low 10 bits of PTE are flags
+    Valid, Writeable, &c
+  again, low 12 bits of physical address are copied from virtual address
+
+* would it be reasonable for page table to just be an array of PTEs?
+  as in Figure 3.1
+  directly indexed by 27 index bits of virtual addresses?
+  how big would page table be?
+  2^27 is roughly 134 million
+  64 bits per entry
+  134*8 MB for a full page table
+    roughly 1GB per page table
+    one page table per address space -- per process
+  would waste lots of memory for small programs!
+    you might only need mappings for a small fraction of possible pages
+    so the rest of the entries would consume RAM but not be needed
+
+* RISC-V 64 uses a "three-level page table" to save space
+  Figure 3.2
+  high 9 bits of va index into level-one page directory
+  PTE from level one has phys addr of level-two page directory
+    2nd 9 bits indexes level-two directory
+  same for 3rd 9 bits
+    now we have PTE for page with desired memory
+  it's really a tree: [diagram]
+    descended 9 bits at a time
+
+* why does tree-shaped page table save space?
+
+* why 9 bits?
+  9 bits determines the size of a page directory
+  9 bits -> 512 PTEs -> 64 bits / PTE -> 4096 bytes, or one page
+  that is, 9 bits means a directory fits on a single page
+
+* isn't traversing the tree expensive, even if happens in hardware?
+  yes, the CPU's MMU typically caches recently-used translations
+  this cache is called the Translation Look-aside Buffer (TLB)
+  to make the TLB effective: page tables of support super pages
+    
+* flags in PTE
+  V, R, W, X, U
+
+* what if V bit not set? or store and W bit not set?
+  "page fault"
+  forces transfer to kernel
+    trap.c in xv6 source
+  xv6 kernel just prints error, kills process
+    "usertrap(): unexpected scause ... pid=... sepc=... stval=..."
+  kernel could install a PTE, resume the process
+    e.g. after loading the page of memory from disk
+    lots of tricks possible here; we'll see some
+
+## Virtual memory in xv6
+
+* kernel page table 
+  Figure 3.3 
+  left side is virtual
+  right is physical
+
+* what is a physical address layout?
+  usually defined by hardware -- the board
+  RAM and memory-mapped device registers
+
+* for us, qemu simulates the board and thus the physical address layout
+  https://github.com/qemu/qemu/blob/master/hw/riscv/virt.c
+  vi +60 virt.c
+  MROM, UART, VIRTIO, DRAM
+  same as the right-hand side of Figure 3.3
+
+* the left side of Figure 3.3 is defined by the kernel's page table
+  which the kernel sets up while booting
+  mostly "direct mapping"
+    allows kernel to use physical address as virtual address
+    very convenient!
+  note no W bit for kernel text
+  note no X bit for kernel data &c
+  xv6 assumes 128 MB of RAM -- PHYSTOP = 0x88000000
+    ought to find RAM size dynamically!
+  way up at the top: trampoline, kernel stacks
+    note the high pages have *two* virtual mappings!
+  kernel executes in trampoline when switching page tables
+    creates user page tables with identical trampoline at same va
+
+* could we run the kernel without paging? turn off the MMU?
+  it's often possible to do that (depends on CPU design)
+  why page the kernel?
+    put RAM where expected
+    double mappings
+    forbid some accesses to catch bugs
+
+* each process has its own address space
+  kernel makes a separate page table per process
+  Figure 3.4
+  kernel switches page tables (i.e. sets satp) when switching processes
+  different processes have similar virtual address layouts
+    but page tables map to different physical addresses in RAM
+
+* why this user address space arrangement?
+  user virtual addresses start at zero
+    predictable, easier for compiler to generate code
+  contiguous addresses -- good for e.g. big arrays
+    but needn't have contiguous phys mem -- no fragmentation problem
+  lots of address range in which to grow
+  both kernel and user map trampoline page
+    eases transition user -> kernel and back
+    but U bit not set
+  how does kernel use user virtual addresses, e.g. passed to read()?
+    kernel software must translate to kernel virtual address
+    consulting that process's page table
+
+## Code walk through
+
+* setup of kernel address space 
+  paging is not enabled when kernel starts, so addresses are physical
+    kernel is compiled/link to start at 0x80000000, where there's RAM
+  kernel must first create its own page table
+  kvmmake() in vm.c
+  building Figure 3.3
+  UART0 at pa=0x10000000, want to direct-map at va=0x10000000
+  kvmmap() adds PTEs to a page table under construction
+    we're not using it yet, it's just data in memory
+
+* let's vmprint() resulting page table (you'll write vmprint())
+  [draw tree, note first PTE's PPN indicates 2nd-level location, &c]
+  the page directory pages came from kalloc()
+    sequential due to the was kinit() worked
+  does the 0..128..0 correspond to va=0x10000000?
+    what VA would use that page table entry?
+    [ L2=0 | L1=128 | L0=0 | offset=0 ]
+    (gdb) print/x 128 << (9+12)
+    $3 = 0x10000000
+    so va is 128 << (12+9) = 0x10000000, as expected
+
+* does UART's last-level PTE refer to the expected physical address?
+  (gdb) print/x (0x10000000 >> 12) << 10
+  $2 = 0x4000000
+  what's the 7 in the low bits of the PTE?
+
+* what about with two pages mapped?
+  move the vmprint to after VIRTIO0 is mapped
+  [add to tree]
+
+* the full kernel page table?
+  it's too big to print this way
+  you can ask qemu for the page table that's in satp
+  ^a c
+  info mem
+  note UART, RAM, trampoline at very top
+  ^a c (to resume)
+
+* kvmmap() calls mappages() in vm.c
+  arguments are root PD, va, size, pa, perm
+  adds mappings from a range of va's to corresponding pa's
+  for each page in the range
+    calls walk to find address of PTE
+      need the PTE's address (not just content) b/c we want to modify
+      walk will create page directory pages if it needs to
+    put the desired pa into the PTE
+    mark PTE as valid w/ PTE_V
+
+* walk() in vm.c
+  walk() mimics how the paging h/w finds the PTE for an address
+  descends the three levels, through three directory pages
+  PX(level, va) extracts the 9 bits at Level level
+  the C type of pagetable is a 512-entry array of 64-bit integers (PTEs)
+  so &pagetable[PX(level, va)] is the address of the PTE we want
+  except at last level:
+    if PTE_V
+      the relevant page-table page already exists
+      PTE2PA extracts the PPN from the PTE as a PA
+      which the kernel can use (as a va) to read the next level
+    if not PTE_V
+      kalloc() a fresh page-table page
+      fill in pte with PPN (using PA2PTE)
+      and mark it PTE_V
+  now the PTE we want is in the page-table page
+
+* kvminithart()
+  load address of the root of the page table into satp
+  Q: is the address a virtual or physical address?
+
+* TLB management
+  CPUs caches paging translation for speed
+  xv6 flushes entire TLB during user/kernel transitions
+    why?
+  RISC-V allows more sophisticated plans
+    * PTE_G: global TLB bits
+      what page could use this?
+    * ASID numbers
+      TLB entries are tagged with ASID, so kernel can flush selectively
+      SATP takes an ASID number
+      sfence.vma also takes an ASID number
+    * super pages
+      2MB and 1GB
+

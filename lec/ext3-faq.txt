@@ -1,0 +1,117 @@
+Frequently Asked Questions for Tweedie's Linux Journaling paper
+
+Q: How are logging and journaling different?
+
+A: For our purposes they are synonyms, referring to the basic ideas
+behind both ext3 and xv6's logging.
+
+Q: In what ways is ext3 better than the xv6 logging design?
+
+A: Perhaps the biggest difference is that ext3 allows concurrent disk
+write and commit of old transactions while accepting updates into the
+current transaction. So new system calls can execute and return
+without waiting for older transactions to finish committing.
+
+In contrast, xv6 has just the one transaction, and new system calls
+can't execute (must block) while the transaction is being written to
+disk and committed.
+
+ext3 only commits every five seconds by default, so that each
+transaction typically contains the updates of many system calls. This
+allows most system calls to return immediately after just updating
+blocks in the cache. And it allows "write absorbtion" in cases where
+successive system calls modify the same file system blocks; such a
+block only has to be written to the log once per transaction, not once
+per system call.
+
+In contrast, most system calls in xv6 trigger a commit, and have to wait
+for the commit to finish.
+
+Q: What is meta-data?
+
+A: i-nodes, directory content blocks, indirect blocks, and free-block
+bitmaps. Everything other than file content blocks.
+
+Q: How does commit frequency affect filesystem performance?
+
+A: Less frequent commits are likely to lead to higher performance.
+Each commit has some overhead -- new system calls have to be briefly
+blocked, and the logging system has to write some extra blocks (the
+descriptor and commit blocks). The more system calls' updates you can
+fit into each transaction (the lower the commit frequency), the lower
+the impact of those overheads. Also big transactions offer more scope
+for write absorbtion (multiple system calls in the same transaction
+updating the same block, so that the block only has to be logged a
+single time despite many udpates).
+
+Q: What does the paper mean by dependent data?
+
+A: The paper's design does not include file content blocks in the log;
+only metadata blocks are logged (i.e. i-nodes, directory content,
+indirect blocks, and free block bitmaps).
+
+In order to avoid a crash leaving a newly written file referring to
+content blocks that contain some previously deleted file's content,
+the paper's design writes content blocks before it commits the
+corresponding meta-data updates to the log. This only applies to
+write() system calls.
+
+The file content blocks that are written before committing are the
+"dependent" blocks.
+
+Q: Why was it taking so long for the previous file system to recover?
+
+A: The previous file system is ext2. ext2 has a checker program,
+called fsck, that inspects all the meta-data on the disk (i-nodes,
+directory content, free bitmaps) to ensure it is consistent. If not,
+fsck attempts to guess a reasonable fix.
+
+The biggest problem with ext2's fsck is that it is slow for big file
+systems -- it can take dozens of minutes or even hours to run on the
+biggest file systems. And during that time the file-system cannot
+be used. People want crash recovery in seconds, not hours.
+
+Another problem with ext2 and fsck is that fsck sometimes can't guess
+a good way to fix problems, and then has to ask for human input.
+
+Q: The paper talks about merging filesystem operations together (top
+of page 5). What does it mean by merging?
+
+A: It means including the updated blocks from multiple system calls in
+one transaction.
+
+Despite the word "merge", the file system doesn't have to merge updates
+from different system calls. The file system code uses locks to ensure
+that only one system call at a time modifies any given piece of
+file-system data. And there's only one copy of any given data in
+memory (in the disk block cache) at a time, so that merges are not
+needed.
+
+Q: What is the paper referring to with "the decision about when to
+commit the current compound transaction and start a new one is a
+policy decision which should be under user control"?
+
+A: The final ext3 design ended up not quite this ambitious, and by
+default just commits every five seconds.
+
+Q: Isn't it a problem that, because ext3 by default commits only every
+five seconds, a crash might result in the loss of up to five seconds
+of system calls? Even though those system calls returned with
+successful return values?
+
+A: It's certainly something to think about. Applications that need to
+ensure that updates are safe on disk can call fsync(fd), which is
+specified to wait (not return) until all previous writes to file
+descriptor fd would survive a crash. fsync() also triggers a commit of
+the currently open transaction. Databases, for example, use fsync().
+
+Q: What does the paper mean by a log-structured filesystem?
+
+A: A log-structured file system has *only* a log -- instead of having
+a file system, with a log that describes recent updates, a
+log-structured file system has only the log, and reads must find what
+they need by looking in the log.
+
+  https://dl.acm.org/doi/10.1145/121132.121137
+  https://en.wikipedia.org/wiki/Log-structured_file_system
+

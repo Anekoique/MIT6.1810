@@ -1,0 +1,152 @@
+Frequently Asked Questions for Lipp et al.'s "Meltdown: Reading Kernel
+Memory from User Space"
+
+Q: Are newer CPUs vulnerable to Meltdown?
+
+A: New Intel CPUs have hardware "fixes" that protect against Meltdown
+but many generations of past CPUs are vulnerable and require KAISER.
+AMD CPUs are believed not to be vulnerable to Meltdown.
+
+There are many other attacks like Meltdown, see below, that are harder
+to fix and involve software defenses as well as hardware defenses.
+This had led to a general discussion about the hardware/software
+contract with respect to isolation.
+
+Q: Are there other microarchitectural side-channel attacks?
+
+A: Yes, many. Meltdown/Spectre were the first but afterwards
+researchers have uncovered many others; see, for example,
+https://en.wikipedia.org/wiki/Spectre_(security_vulnerability).  Course
+6 offers now a class in hardware security (6.5950,
+https://shd.mit.edu/).
+
+On Linux, run "grep . /sys/devices/system/cpu/vulnerabilities/*" to
+see vulnerabilities and mitigations for your CPU.
+
+Q: How do we protect against side-channel attacks in general? Is it
+possible to eliminate the existence of side channels?
+
+A: Side channel attacks come in many shapes (see
+https://en.wikipedia.org/wiki/Side-channel_attack). Historically
+people worried about EM signals leaking (take a look at
+http://cryptome.org/nsa-tempest.pdf).  Crypto code worries about
+timing side channels to avoid leaking bits of secret keys and attempt
+to write the crypto code in a way that is constant time.  Spectre and
+Meltdown attacks are a new class of side-channel attacks, based on
+leaking secrets through micro-architectural features. Before
+these attacks, these kind of side channels were assumed away, but now
+they are exploitable, and there is a tremendous activities in finding
+new ones and identifying solutions (see above).
+
+Q: Before Meltdown was discovered, why was it common to map the kernel
+memory mapped into the user page table?
+
+A: It was the standard way for many decades until these attacks were
+discovered.  It was pretty much universal that user memory starts at
+zero and kernel in high addresses.  Mapping both user and kernel makes
+system calls faster, since you can pass pointers instead of having to
+copy data.
+
+Q: How does KAISER relate to xv6's use of page tables?
+
+A: Xv6 implements KAISER, if you will; the kernel runs with its own
+page table and user processes don't map kernel memory.  So, user
+programs cannot even cook up an address that refers to kernel memory.
+The attack exploits that before 2018 user program also mapped all of
+kernel memory (but without read/write access, like the trampoline
+page), which allow user programs to cook up addresses that refer to
+kernel memory.
+
+Q: How does the meltdown ensure that out-of-order execution occurs to
+complete the attack?
+
+A: The Intel CPUs attacked in the paper is likely to speculatively
+execute passed a mov instruction to keep its instruction pipeline full
+and its execution units busy.  The authors cannot make the attack
+reliably work, however, as seen from the xx in listings 3 and 4.  One
+reason might be that it works well only if the mov on line 4 hits in
+the L1 cache.
+
+Q: How do we know if an instruction is transient?
+
+A: We don't, because we don't know how the CPU is implemented (Intel
+CPUs are not open source), and thus we cannot know up front if an
+instruction leaves measurable side effects.  Only if someone figures
+out a way to exploit the instruction do we know it is transient.
+
+Q: How could a CPU be fixed to stop the meltdown attack?
+
+A: Since Intel CPUs are closed source, it is hard to know what Intel
+did. The CPU could check the permission in the TLB in parallel with
+the lookup in the L1 and uses a 0 instead of the actual value when the
+permissions don't check out, so that subsequent speculative
+instructions will see a 0 until the mov retires (and the exception is
+raised).
+
+Q: What is the relationship between Meltdown and Spectre?
+
+A: They are both micro-architectural side-channel attacks leveraging
+speculative execution, but different in what they exploit. Meltdown
+exploits that a data access bypasses a page-table protection check.
+Spectre exploits that a data access bypasses an array-bound check.
+This paper reviews them together:
+https://css.csail.mit.edu/6.858/2022/readings/spectre-meltdown.pdf
+
+Q: What is KASLR?
+
+A: KASLR (Kernel Address space layout randomization) puts the kernel
+text at a random offset in the virtual address space so that it makes
+it harder for attackers to guess where kernel functions are located.
+But, once an attacker knows the offset, the attacker can figure out
+the address for each function.
+
+Address space randomization makes Meltdown slightly more challenging
+to succeed because the attacker has to figure out the offset, but this
+turns out not to be a huge hurdle.
+
+You can read about KASLR here:
+https://lwn.net/Articles/569635/.
+
+KAISR was originally developed to defend KASLR against side-channel
+attacks. KAISR also happens to defend against Meltdown.
+
+Q: Has Meltdown been used in the wild?
+
+A: This an attack discovered by researchers who followed the security
+disclosure protocol. I am unaware of "in-the-wild" attacks, but, of
+course, we might not know because the attacker wouldn't say so.
+
+Q: What is the performance impact of KAISER/KPTI?
+
+A: KPTI/KAISER has a performance impact ranging from neglible to 10%
+on io-intensive workloads, depending on the exact workload.  See
+https://en.wikipedia.org/wiki/Meltdown_(security_vulnerabil for some
+references.  This thesis also explores this:
+https://pdos.csail.mit.edu/papers/behrensj-phd-thesis.pdf
+
+Q: Do modern OSes have notions of "sensitive" data, which might allow
+for more fine-grained control over page mappings?
+
+A: There are efforts in this direction; for example, see MAP_EXCLUSIVE
+( https://lwn.net/Articles/804658/).
+
+Q: How can future mitigations like KAISER address speculative
+execution vulnerabilities like Meltdown, balancing security and
+performance?
+
+A: Users can chose this trade-off by deciding which mitigations to
+enable.  You can see this on Linux using by running "grep
+. /sys/devices/system/cpu/vulnerabilities/*".  Linux distributions
+ship with defaults that make an implicit judgement (e.g., enable SMT
+even though it is a security risk).
+
+Q: How are microarchitectural side channels persisted and cleared?
+
+A: There is no explicit API for this. It is a side-effect how the CPU
+implements micro-architectural features.  For example, in the paper
+the L1 cache is the place where a side-channel is "persisted" as a
+side-effect of speculative execution.  The L1 cache-line might be
+"cleared" because of a cache conflict that replaces the line of
+interest.  You can see from the XXs in listing 3 and 4 that indeed the
+attack isn't reliable.
+

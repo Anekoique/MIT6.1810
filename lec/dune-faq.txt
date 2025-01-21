@@ -1,0 +1,79 @@
+Frequently Asked Questions for "Dune: Safe User-level Access to
+Privileged CPU Features".
+
+Q: Why is it useful for Dune to expose the virtual memory hardware
+to user processes?
+
+A: There are a bunch of neat things an application can do if it can
+control how its own virtual memory is set up, and if it can handle its
+own page faults. Last week's "Virtual Memory Primitives for User
+Programs" paper talked about some, and the Dune paper's Application
+section mentions sandboxing and a few others.
+
+Q: If user mode processes in Dune mode run in ring 0 (supervisor
+mode), how are they prevented from accessing privileged resources?
+
+A: The CPU hardware acts slightly differently in "VMX non-root mode".
+
+One way is that virtual address translation proceeds through two page
+tables: the page table controlled by the process (in %cr3, the
+equivalent of satp), and a separate page table called EPT that the
+process cannot look at or modify. When the process uses a virtual
+address, the MMU first translates it to a "guest physical address" using
+the process's %cr3 page table, and then uses the EPT to translate that
+guest physical address to a real physical address. The underlying kernel
+configures the EPT to only allow access to the process's own physical
+pages.
+
+Another aspect is that the underlying kernel's privileged control
+registers are saved when the kernel executes VMLAUNCH or VMRESUME to
+enter the process; and restored whenever control exits the process back
+into the kernel. This means that the process cannot tamper with the
+kernel's control registers.
+
+Another mechanism is that device interrupts (including the timer that
+drives involuntary context switch) are delivered to the underlying
+kernel, not to the process. The CPU only delivers page faults and
+exceptions like divide-by-zero directly to the process.
+
+The meanings of some of the control registers are modified in VMX
+non-root mode. For example, the interrupt-enable flag is ignored;
+interrupts are always delivered to the underlying kernel.
+
+Q: How does the overhead to create a Dune child process compare to
+that of the native implementation in Linux?
+
+A: The paper does not discuss this. It must take significantly longer
+to create a new Dune process than to just call ordinary fork(). One
+has to create a VMCS and an EPT, and switching into the process (to
+get it running, and every time there's a switch) with VMLAUNCH and
+VMRESUME must be more expensive than ordinary kernel->user transition
+because more state has to be saved and restored.
+
+Q: The paper mentions that it takes special care about the ELF loader
+when loading sandboxed processes. What is the issue here?
+
+A: The danger is that a program's ELF headers might exploit a bug in
+the ELF loader code, in particular in the code that parses the complex
+ELF headers. If you run the ELF loader in privileged code, and load a
+malicious ELF file, then a bug may allow an attacker to trick that
+privileged code into doing something bad. In this situation, the user
+process is privileged -- for example it might be your web browser,
+which knows sensitive data like passwords you have typed into web
+sites.
+
+So the scheme seems to be to run the first ELF loader in privileged
+code, but to have it load a known non-malicious second loader into the
+sandbox. Then the second loader runs in the sandbox and reads the ELF
+program that might be malicious. So only that second loader is exposed
+to attack. Since the second loader is running in the sandbox, a
+successful attack will hopefully not be a problem.
+
+Q: Why does the paper find a high TLB miss rate in the EPT?
+
+A: My guess: the MMU's traversal of each level of the main %cr3 page
+table requires a complete EPT lookup (to translate the "guest
+physical" address in that level's PTE to a "host physical" address).
+So more addresses have to be looked up (in the EPT), and thus there's
+more pressure on the part of the TLB that caches guest physical to
+host physical translations.
