@@ -2,8 +2,6 @@
 #include "kernel/stat.h"
 #include "user/user.h"
 
-#define PID_LEN 10
-
 int 
 main(int argc, char *argv[])
 {
@@ -14,7 +12,7 @@ main(int argc, char *argv[])
   if (fork() == 0) {
     while (read(p[0], &buf, 1) > 0) {
       close(p[0]);
-      printf("%d: received ping\n", getpid());
+      printf("%d:  received ping\n", getpid());
       write(p[1], &byte, 1);
       close(p[1]);
       exit(0);
@@ -26,7 +24,7 @@ main(int argc, char *argv[])
     wait(0);
     while (read(p[0], &buf, 1) > 0) {
       close(p[0]);
-      printf("%d: received pong\n", getpid());
+      printf("%d:  received pong\n", getpid());
     }
   }
   exit(0);
