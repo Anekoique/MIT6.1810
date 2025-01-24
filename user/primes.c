@@ -35,7 +35,7 @@ primes(int pipefd)
     close(pipefd);
     exit(0);
   }
-  else printf("primes %d\n", divisor);
+  else printf("prime %d\n", divisor);
 
   int p[2];
   int num;

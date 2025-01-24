@@ -45,6 +45,7 @@ ls(char *path)
   switch(st.type){
   case T_DEVICE:
   case T_FILE:
+    printf("here\n");
     printf("%s %d %d %d\n", fmtname(path), st.type, st.ino, (int) st.size);
     break;
 
