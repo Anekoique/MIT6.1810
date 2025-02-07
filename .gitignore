@@ -26,3 +26,5 @@ barrier
 *.dSYM
 *.pcap
 .cache
+.vscode
+.clang-format
