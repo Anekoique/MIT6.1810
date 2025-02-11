@@ -27,4 +27,3 @@ barrier
 *.pcap
 .cache
 .vscode
-.clang-format
