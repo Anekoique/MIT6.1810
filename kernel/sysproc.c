@@ -96,7 +96,7 @@ sys_kpgtbl(void)
   struct proc *p;  
 
   p = myproc();
-  vmprint(p->pagetable);
+  vmprint(p->pagetable, 0, 0);
   return 0;
 }
 #endif
