@@ -279,7 +279,15 @@ growproc(int n)
   struct proc *p = myproc();
 
   sz = p->sz;
-  if(n > 0){
+  if (n > SUPERPGSIZE) {
+    uint64 round = SUPERPGROUNDUP(sz);
+    if((sz = uvmalloc(p->pagetable, sz, round, PTE_W)) == 0) {
+      return -1;
+    }
+    if((sz = uvmsuperalloc(p->pagetable, round, sz + n, PTE_W)) == 0) {
+      return -1;
+    }
+  } else if(n > 0){
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
       return -1;
     }
