@@ -251,6 +251,8 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not a leaf");
     if (is_superpage(pagetable, a))
       sz = SUPERPGSIZE;
+    else
+      sz = PGSIZE;
     if(do_free){
       uint64 pa = PTE2PA(*pte);
       sz == PGSIZE ? kfree((void*)pa) : superfree((void *)pa);
@@ -381,14 +383,6 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   if(newsz >= oldsz)
     return oldsz;
 
-  if (oldsz - newsz >= SUPERPGSIZE) {
-    if (SUPERPGROUNDUP(newsz) < SUPERPGROUNDUP(oldsz)) {
-      int npages = (SUPERPGROUNDUP(oldsz) - SUPERPGROUNDUP(newsz)) / PGSIZE;
-      uvmunmap(pagetable, SUPERPGROUNDUP(newsz), npages, 1);
-      return newsz;
-    }
-  }
-
   if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
     uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
@@ -460,6 +454,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
         goto err;
       }
     } else {
+      szinc = PGSIZE;
       if ((mem = kalloc()) == 0) goto err;
       memmove(mem, (char*)pa, szinc);
       if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){

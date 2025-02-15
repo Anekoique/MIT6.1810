@@ -132,6 +132,13 @@ found:
     return 0;
   }
 
+  // Allocate a usyscall page.
+  if((p->usyscall = (struct usyscall *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -158,6 +165,9 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if (p->usyscall)
+    kfree((void*)p->usyscall);
+  p->usyscall = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -199,13 +209,6 @@ proc_pagetable(struct proc *p)
               (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
     uvmfree(pagetable, 0);
-    return 0;
-  }
-
-  // Allocate a usyscall page.
-  if((p->usyscall = (struct usyscall *)kalloc()) == 0){
-    freeproc(p);
-    release(&p->lock);
     return 0;
   }
 
@@ -276,17 +279,24 @@ int
 growproc(int n)
 {
   uint64 sz;
+  uint64 oldsz, newsz;
   struct proc *p = myproc();
 
   sz = p->sz;
+  oldsz = sz;
   if (n > SUPERPGSIZE) {
     uint64 round = SUPERPGROUNDUP(sz);
-    if((sz = uvmalloc(p->pagetable, sz, round, PTE_W)) == 0) {
+    if((newsz = uvmalloc(p->pagetable, sz, round, PTE_W)) == 0) {
       return -1;
     }
-    if((sz = uvmsuperalloc(p->pagetable, round, sz + n, PTE_W)) == 0) {
-      return -1;
+    sz = newsz;
+    if((newsz = uvmsuperalloc(p->pagetable, round, oldsz + n, PTE_W)) == 0) {
+      if((newsz = uvmalloc(p->pagetable, round, oldsz + n, PTE_W)) == 0) {
+        newsz = uvmdealloc(p->pagetable, sz, oldsz);
+        return -1;
+      }
     }
+    sz = newsz;
   } else if(n > 0){
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
       return -1;

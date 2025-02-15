@@ -14,7 +14,7 @@
 #define SUPERPGSTART (PHYSTOP-SUPERPGSIZE*SUPERPGNUM)
 #endif
 
-void freerange(void *pa_start, void *pa_end, int size);
+void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
@@ -33,17 +33,19 @@ void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
-  freerange(end, (void*)SUPERPGSTART, PGSIZE);
-  freerange((void *)SUPERPGSTART, (void *)PHYSTOP, SUPERPGSIZE);
+  freerange(end, (void*)PHYSTOP);
 }
 
 void
-freerange(void *pa_start, void *pa_end, int size)
+freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + size < (char*)pa_end; p += size)
-    size == PGSIZE ? kfree(p) : superfree(p);
+  for(; p + PGSIZE < (char*)SUPERPGSTART; p += PGSIZE)
+    kfree(p);
+  p = (char *)SUPERPGROUNDUP((uint64)p);
+  for (; p + SUPERPGSIZE < (char *)pa_end; p += SUPERPGSIZE)
+    superfree(p);
 }
 
 // Free the page of physical memory pointed at by pa,
