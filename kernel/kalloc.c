@@ -106,7 +106,6 @@ addreference(void *pa)
   release(&kmem.lock);
 }
 
-
 void
 subreference(void *pa)
 {
