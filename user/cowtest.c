@@ -218,9 +218,51 @@ forkforktest()
   printf("ok\n");
 }
 
+void
+copyout(char *s)
+{
+  uint64 addrs[] = { 0x0111LL, 0x80000000LL, 0x3fffffe000, 0x3ffffff000, 0x4000000000,
+                     0xffffffffffffffff };
+
+  for(int ai = 0; ai < sizeof(addrs)/sizeof(addrs[0]); ai++){
+    uint64 addr = addrs[ai];
+
+    int fd = open("README", 0);
+    if(fd < 0){
+      printf("open(README) failed\n");
+      exit(1);
+    }
+    int n = read(fd, (void*)addr, 8192);
+    if(n > 0){
+      printf("read(fd, %p, 8192) returned %d, not -1 or 0\n", (void*)addr, n);
+      exit(1);
+    }
+    close(fd);
+
+    int fds[2];
+    if(pipe(fds) < 0){
+      printf("pipe() failed\n");
+      exit(1);
+    }
+    n = write(fds[1], "x", 1);
+    if(n != 1){
+      printf("pipe write failed\n");
+      exit(1);
+    }
+    n = read(fds[0], (void*)addr, 8192);
+    if(n > 0){
+      printf("read(pipe, %p, 8192) returned %d, not -1 or 0\n", (void*)addr, n);
+      exit(1);
+    }
+    close(fds[0]);
+    close(fds[1]);
+  }
+}
+
 int
 main(int argc, char *argv[])
 {
+  copyout("copyout");
   simpletest();
 
   // check that the first simpletest() freed the physical memory.

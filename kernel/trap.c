@@ -67,6 +67,9 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if (r_scause() == 15) {
+    if (pagefaulthandler(r_stval()) != 0)
+      setkilled(p);
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
@@ -81,6 +84,45 @@ usertrap(void)
     yield();
 
   usertrapret();
+}
+
+int
+pagefaulthandler(uint64 fault_addr)
+{
+  struct proc *p = myproc();
+  uint64 pa, va;
+  uint flags;
+  pte_t *pte;
+  char *mem;
+
+  if (fault_addr >= MAXVA)
+    return -1;
+  va = PGROUNDDOWN(fault_addr);
+
+  if ((pte = walk(p->pagetable, va, 0)) == 0) {
+    printf("Page Fault: pte should exist\n");
+    return -1;
+  }
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+  if ((*pte & PTE_V) == 0 || (flags & PTE_COW) == 0) {
+    printf("Page Fault: error\n");
+    return -1;
+  }
+  
+  if ((mem = kalloc()) == 0) {
+    printf("Page Fault: no free memory\n");
+    return -1;
+  }
+  memmove(mem, (char *)pa, PGSIZE);
+  uvmunmap(p->pagetable, va, 1, 1);
+  if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, flags | PTE_W) != 0) {
+    kfree(mem);
+    printf("Page Fault: Cow map fault\n");
+    return -1;
+  }
+  return 0;
 }
 
 //
