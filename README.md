@@ -338,7 +338,7 @@ $ exit
 
 之后和`uvmalloc`一样分配超页面，开始我想把两者封装在一起，发现还是独立函数更为清晰
 
-![image-20250215194748728](../../../.config/Typora/typora-user-images/image-20250215194748728.png)
+![image-20250215194748728](./images/image-20250215194748728.png)
 
 之后比较关键的是页表映射，需要让level1的pte直接映射到物理内存而不是下一级的pte，相当于没有了L0但多了9位的offset，这里主要改动的是`walk`
 
@@ -456,7 +456,7 @@ https://decaf-lang.github.io/minidecaf-tutorial-deploy/docs/lab5/stackframe.html
 
 ![image-20250218165550454](./images/image-20250218165550454.png)
 
-<img src="../../../.config/Typora/typora-user-images/image-20250218170150882.png" alt="image-20250218170150882" style="zoom:80%;" />
+<img src="./images/image-20250218170150882.png" alt="image-20250218170150882" style="zoom:80%;" />
 
 <img src="./images/image-20250218170246755.png" alt="image-20250218170246755" style="zoom:80%;" />
 
