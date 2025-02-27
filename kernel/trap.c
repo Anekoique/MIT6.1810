@@ -5,6 +5,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -67,6 +70,9 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if (r_scause() == 13 || r_scause() == 15) {
+    if (pagefaulthandler(r_stval()) == -1)
+      setkilled(p);
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
@@ -81,6 +87,65 @@ usertrap(void)
     yield();
 
   usertrapret();
+}
+
+int
+conflictdet(struct VMA *vmas, uint64 va, int len)
+{
+  for (int i = 0; i < NVMA; i++) {
+    if (vmas[i].len) {
+      uint64 left = vmas[i].addr;
+      uint64 right = vmas[i].addr + vmas[i].len;
+      if (va < right && va+len >= left)
+        return i;
+    }
+  }
+  return -1;
+}
+
+int
+pagefaulthandler(uint64 fault_addr)
+{
+  int n;
+  uint64 va;
+  uint64 pa;
+  char *mem;
+  struct VMA *vma;
+  struct proc *p = myproc();
+
+
+  printf("fault.addr: %p\n", (void *)fault_addr);
+  int index;
+  if ((index = conflictdet(p->vmas, fault_addr, 0)) == -1) {
+    printf("page fault: addr not assigned\n");
+    return -1;
+  }
+  vma = &p->vmas[index];
+  va = PGROUNDDOWN(fault_addr);
+
+  if ((pa = walkaddr(p->pagetable, fault_addr)) != 0) 
+    if (!(PA2PTE(pa) & PTE_W))
+      return -1;
+
+  if ((mem = kalloc()) == 0) {
+    printf("page fault: Page Fault: no free memory\n");
+    return -1;
+  }
+  memset(mem, 0, PGSIZE);
+
+  ilock(vma->f->ip);
+  if ((n = readi(vma->f->ip, 0, (uint64)mem, vma->offset + va - vma->addr, PGSIZE)) < 0) {
+    printf("page fault: read file fail\n");
+    iunlock(vma->f->ip);
+    return -1;
+  }
+  iunlock(vma->f->ip);
+  if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_U | (vma->prot << 1)) != 0) {
+    kfree(mem);
+    printf("Page Fault: mmap map fault\n");
+    return -1;
+  }
+  return 0;
 }
 
 //

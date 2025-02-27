@@ -434,6 +434,7 @@ more_test()
     p = mmap(0, PGSIZE*2, PROT_READ, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED)
       err("mmap");
+    printf("here\n");
     // this should cause a fatal fault
     *p = 0;
     exit(*p);

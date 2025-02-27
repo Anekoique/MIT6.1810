@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -501,5 +502,105 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+uint64
+sys_mmap(void)
+{
+  int index;
+  int fd;
+  uint64 va;
+  struct VMA vma;
+  struct proc *p = myproc();
+
+  // get args
+  argaddr(0, &vma.addr);
+  argint(1, &vma.len);
+  vma.len = PGROUNDUP(vma.len);
+  argint(2, &vma.prot);
+  argint(3, &vma.flags);
+  if (argfd(4, &fd, &vma.f) < 0)
+    return -1;
+  argint(5, &vma.offset);
+
+  // check prot and flags
+  if (!(vma.flags & MAP_PRIVATE) && ((!vma.f->readable && (vma.prot & PROT_READ)) 
+    || (!vma.f->writable && (vma.prot & PROT_WRITE))))
+    return -1;
+
+  // find a vma to store
+  for (index = 0; index < NVMA; index++)
+    if (!p->vmas[index].len) break;
+  if (index == NVMA) panic("sys_mmap: no VMA to free");
+  p->vmas[index] = vma;
+  filedup(p->vmas[index].f);
+
+  // find a va space to map
+  for (va = VMABASE; va > 0; va -= PGSIZE) {
+    if ((walkaddr(p->pagetable, va)) != 0) continue;
+
+    uint64 vaend = va;
+    for (; va > vaend - vma.len; va -= PGSIZE)
+      if ((walkaddr(p->pagetable, va)) != 0) break;
+
+    if (va == vaend - vma.len && conflictdet(p->vmas, va + PGSIZE, vma.len)) {
+      p->vmas[index].addr = va + PGSIZE;
+      p->vmas[index].base = va + PGSIZE;
+      break;
+    }
+  }
+
+  printf("vma.addr: %p\n", (void *)p->vmas[index].addr);
+  if (p->vmas[index].addr) return p->vmas[index].addr;
+  else return -1;
+}
+
+uint64 
+sys_munmap(void)
+{
+  int length;
+  int writelen;
+  int index;
+  uint64 addr;
+  uint64 writeaddr;
+  struct VMA *vma;
+  struct inode *ip;
+  struct proc *p = myproc();
+
+  argaddr(0, &addr);
+  argint(1, &length);
+  if ((index = conflictdet(p->vmas, addr, 0)) == -1)
+    panic("munmap: not assigned addr");
+  vma = &p->vmas[index];
+  ip = vma->f->ip;
+
+  writelen = addr - vma->base + vma->offset + length > ip->size ?
+  (ip->size - (addr - vma->base + vma->offset)) : length;
+  if (writelen < 0) writelen = 0;
+
+  writeaddr = vma->offset + addr - vma->base > ip->size ? 
+  (vma->offset) : vma->offset + addr - vma->base;
+
+  if (vma->flags & MAP_SHARED) {
+    begin_op();
+    ilock(ip);
+    if ((writei(ip, 1, addr, writeaddr, writelen)) < 0) {
+      iunlock(ip);
+      end_op();
+      printf("writelen:%d\n", writelen);
+      panic("mumap: write back error");
+    }
+    iunlock(ip);
+    end_op();
+  }
+
+  vmaunmap(p->pagetable, addr, PGROUNDUP(length) / PGSIZE, 1);
+  vma->len -= PGROUNDUP(length);
+  if (vma->len) {
+    if (addr == vma->addr)
+      vma->addr += PGROUNDUP(length);
+  } else
+    fileclose(vma->f);
   return 0;
 }
