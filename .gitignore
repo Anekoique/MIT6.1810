@@ -1,7 +1,2 @@
 .vscode/
 .cache/      
-.gdbinit     
-fs.img       
-kernel/      
-mkfs/         
-user/        
