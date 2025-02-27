@@ -1,1 +1,8 @@
 .vscode/
+.cache/      
+.gdbinit     
+fs.img       
+images/      
+kernel/      
+mkfs/         
+user/        
