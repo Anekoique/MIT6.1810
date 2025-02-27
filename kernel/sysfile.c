@@ -551,7 +551,6 @@ sys_mmap(void)
     }
   }
 
-  printf("vma.addr: %p\n", (void *)p->vmas[index].addr);
   if (p->vmas[index].addr) return p->vmas[index].addr;
   else return -1;
 }

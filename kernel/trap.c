@@ -113,8 +113,6 @@ pagefaulthandler(uint64 fault_addr)
   struct VMA *vma;
   struct proc *p = myproc();
 
-
-  printf("fault.addr: %p\n", (void *)fault_addr);
   int index;
   if ((index = conflictdet(p->vmas, fault_addr, 0)) == -1) {
     printf("page fault: addr not assigned\n");
