@@ -1,0 +1,6 @@
+usertrap
+0x7 SYS_exec
+0x200000022 user mode
+a3
+kernel address 0 is not mapped to physical address
+initcode 1
